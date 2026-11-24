@@ -84,10 +84,16 @@ with open(path, "r+", encoding="utf-8") as fh:
         raise ValueError("model-relay config 'providers' must be an object")
 
     if op == "add":
-        if providers.get("agy") == desired:
+        merged = dict(desired)
+        existing = providers.get("agy")
+        if isinstance(existing, dict):
+            for key in ("model", "models", "efforts"):
+                if key in existing:
+                    merged[key] = existing[key]
+        if existing == merged:
             print("model-relay provider agy: unchanged")
             sys.exit(0)
-        providers["agy"] = desired
+        providers["agy"] = merged
     elif op == "remove":
         if "agy" not in providers:
             print("model-relay provider agy: unchanged")

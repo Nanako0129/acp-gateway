@@ -123,13 +123,26 @@ def _nearest(thinking: str, offered: list[str]) -> str | None:
 
 
 def _composite(model: str, thinking: str | None, legacy_ids: list[str]) -> str:
-    """``<base>-<level>`` nearest to ``thinking`` among the siblings agy offers when ``model`` is a composite id
-    (``gemini-4-hydrogen-medium``), else ``model``."""
-    base, _, suffix = model.rpartition("-")
-    if not thinking or suffix not in THINKING_LEVELS:
+    """Resolve ``model`` + ``thinking`` against ``legacy_ids`` offered by agy.
+
+    For composite ids (``gemini-4-hydrogen-medium``), swaps the suffix to the nearest offered sibling.
+    For base ids (``gemini-4-hydrogen``), prefers an exact ``<model>-<thinking>`` match, keeps ``model``
+    itself when offered (so ``thought_level`` can be set via configOptions without escalating), and
+    otherwise falls back to the nearest ``<model>-<level>`` sibling.
+    """
+    if not thinking or thinking not in THINKING_LEVELS:
         return model
-    level = _nearest(thinking, [i.rpartition("-")[2] for i in legacy_ids if i.rpartition("-")[0] == base])
-    return f"{base}-{level}" if level else model
+    base, _, suffix = model.rpartition("-")
+    if suffix in THINKING_LEVELS:
+        level = _nearest(thinking, [i.rpartition("-")[2] for i in legacy_ids if i.rpartition("-")[0] == base])
+        return f"{base}-{level}" if level else model
+    candidate = f"{model}-{thinking}"
+    if candidate in legacy_ids:
+        return candidate
+    if model in legacy_ids:
+        return model
+    level = _nearest(thinking, [i.rpartition("-")[2] for i in legacy_ids if i.rpartition("-")[0] == model])
+    return f"{model}-{level}" if level else model
 
 
 def select_model(conn: AcpConnection, session_id: str, new_result: dict[str, Any], model: str,
@@ -137,11 +150,17 @@ def select_model(conn: AcpConnection, session_id: str, new_result: dict[str, Any
     """Pick the model, then the thinking level.
 
     A composite id (``gemini-4-hydrogen-medium``) carries its level: the requested level swaps the suffix when agy
-    offers siblings (nearest offered level; covers ``xhigh``). Otherwise the ``thought_level`` option is set to
-    the nearest level it offers.
+    offers siblings (nearest offered level; covers ``xhigh``). A base id (``gemini-4-hydrogen``) promotes to an
+    exact ``<model>-<thinking>`` sibling when offered, keeps the base id when offered so ``thought_level`` can
+    be applied via ``configOptions``, or otherwise falls back to the nearest ``<model>-<level>`` sibling.
     """
-    legacy = [str(m.get("modelId")) for m in (new_result.get("models") or {}).get("availableModels") or []
-              if isinstance(m, dict)]
+    models = new_result.get("models")
+    avail = models.get("availableModels") if isinstance(models, dict) else None
+    legacy = [
+        m["modelId"]
+        for m in (avail if isinstance(avail, list) else ())
+        if isinstance(m, dict) and isinstance(m.get("modelId"), str) and m["modelId"]
+    ]
     picked = _composite(model, thinking, legacy) if model else ""
     if picked:
         _set_model(conn, session_id, new_result, picked)

@@ -9,7 +9,7 @@ import pytest
 
 from acp_gateway.core.acp_connection import AcpError
 from acp_gateway.core.permission import PermissionGate
-from acp_gateway.core.session import NATIVE_TOOLS, new_session
+from acp_gateway.core.session import NATIVE_TOOLS, _composite, new_session, select_model
 
 from .conftest import dump
 
@@ -104,3 +104,88 @@ def test_cancel_ends_prompt_cancelled(connect):
     t.join(10)
     assert out[0].stop_reason == "cancelled"
     assert requests_of(conn, "session/cancel") == [{"sessionId": session.session_id}]
+
+
+@pytest.mark.parametrize(
+    ("model", "thinking", "legacy_ids", "expected"),
+    [
+        ("gemini-4-hydrogen", "xhigh", ["gemini-4-hydrogen", "gemini-4-hydrogen-xhigh"], "gemini-4-hydrogen-xhigh"),
+        ("gemini-4-hydrogen", "low", ["gemini-4-hydrogen", "gemini-4-hydrogen-xhigh"], "gemini-4-hydrogen"),
+        (
+            "gemini-4-neon",
+            "xhigh",
+            ["gemini-4-neon-medium", "gemini-4-neon-high", "gemini-4-neon-xhigh"],
+            "gemini-4-neon-xhigh",
+        ),
+        (
+            "gemini-4-neon",
+            "low",
+            ["gemini-4-neon-medium", "gemini-4-neon-high", "gemini-4-neon-xhigh"],
+            "gemini-4-neon-medium",
+        ),
+        (
+            "gemini-4-hydrogen-medium",
+            "xhigh",
+            ["gemini-4-hydrogen-medium", "gemini-4-hydrogen-xhigh"],
+            "gemini-4-hydrogen-xhigh",
+        ),
+        ("gemini-4-hydrogen", None, ["gemini-4-hydrogen", "gemini-4-hydrogen-xhigh"], "gemini-4-hydrogen"),
+        ("gemini-4-hydrogen", "unknown", ["gemini-4-hydrogen", "gemini-4-hydrogen-xhigh"], "gemini-4-hydrogen"),
+    ],
+)
+def test_composite_model_resolution(model, thinking, legacy_ids, expected):
+    assert _composite(model, thinking, legacy_ids) == expected
+
+
+def test_select_model_ignores_non_string_and_null_available_model_ids():
+    class FakeConn:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        def request(self, method: str, params: dict, timeout: float | None = None):
+            self.calls.append((method, params))
+            return {}
+
+    new_result = {
+        "models": {
+            "availableModels": [
+                {"modelId": None},
+                {"modelId": 123},
+                {"modelId": ""},
+                {},
+                "not-a-dict",
+                {"modelId": "gemini-4-hydrogen"},
+                {"modelId": "gemini-4-hydrogen-xhigh"},
+            ]
+        },
+        "configOptions": [
+            {
+                "id": "thinking_level",
+                "category": "thought_level",
+                "options": [{"value": "low"}, {"value": "medium"}, {"value": "high"}],
+            }
+        ],
+    }
+
+    # Non-string/null modelIds are ignored (never coerced to "None") and base model + low sets thought_level
+    conn_low = FakeConn()
+    select_model(conn_low, "s1", new_result, "gemini-4-hydrogen", "low")
+    assert conn_low.calls == [
+        ("session/set_model", {"sessionId": "s1", "modelId": "gemini-4-hydrogen"}),
+        ("session/set_config_option", {"sessionId": "s1", "configId": "thinking_level", "value": "low"}),
+    ]
+
+    # Exact composite promotion for xhigh skips thought_level configOption
+    conn_xhigh = FakeConn()
+    select_model(conn_xhigh, "s1", new_result, "gemini-4-hydrogen", "xhigh")
+    assert conn_xhigh.calls == [
+        ("session/set_model", {"sessionId": "s1", "modelId": "gemini-4-hydrogen-xhigh"}),
+    ]
+
+    # Null modelId never matches a model named "None"
+    conn_none = FakeConn()
+    none_only = {"models": {"availableModels": [{"modelId": None}, {"modelId": "None-xhigh"}]}}
+    select_model(conn_none, "s1", none_only, "None", "low")
+    assert conn_none.calls == [
+        ("session/set_model", {"sessionId": "s1", "modelId": "None-xhigh"}),
+    ]

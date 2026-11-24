@@ -102,8 +102,30 @@ def test_sse_frames_cannot_be_injected_by_model_text():
 def test_only_gemini_models_reach_agy():
     assert pick_model("gemini-4-hydrogen-medium[1m]", "d") == "gemini-4-hydrogen-medium"
     assert pick_model("acp-gemini-4-hydrogen-medium[1m]", "d") == "gemini-4-hydrogen-medium"
-    assert pick_model("claude-opus-5-5", "d") == "d" and pick_model("gpt-oss-120b-medium", "d") == "d"
-    assert pick_model("acp-claude-opus-5-5", "d") == "d"
+    assert pick_model("acp-gemini-4-hydrogen[1m]", "d") == "gemini-4-hydrogen"
+    exact_128 = "gemini-4-" + ("a" * 119)
+    assert len(exact_128) == 128
+    assert pick_model(exact_128, "d") == exact_128
+    over_129 = "gemini-4-" + ("a" * 120)
+    assert len(over_129) == 129
+    assert pick_model(over_129, "d") == "d"
+    for bad in (
+        "claude-opus-5-5",
+        "gpt-oss-120b-medium",
+        "acp-claude-opus-5-5",
+        {"a": 1},
+        ["gemini-4-neon"],
+        123,
+        None,
+        "gemini-4-абв",
+        "gemini-4-hydrogen\n",
+        "gemini-4-hydrogen\x00",
+        "gemini-4-hydrogen[1m]\n",
+        "gemini-4-hydrogen[\x00]",
+        " gemini-4-hydrogen ",
+        "gemini-4-hydrogen[" + ("x" * 20) + "]",
+    ):
+        assert pick_model(bad, "d") == "d", repr(bad)
 
 
 @pytest.mark.parametrize(("body", "expected"), [
@@ -120,6 +142,20 @@ def test_only_gemini_models_reach_agy():
 def test_pick_thinking_mapping(monkeypatch, body, expected):
     monkeypatch.delenv("ACP_GATEWAY_THINKING_LEVEL", raising=False)
     assert pick_thinking(body) == expected
+
+
+def test_pick_thinking_non_dict_fields_do_not_raise(monkeypatch):
+    monkeypatch.delenv("ACP_GATEWAY_THINKING_LEVEL", raising=False)
+    for body in (
+        {"thinking": True},
+        {"thinking": "disabled"},
+        {"thinking": ["disabled"]},
+        {"output_config": "high"},
+        {"output_config": True},
+        {"output_config": 123},
+        {"thinking": True, "output_config": "xhigh"},
+    ):
+        assert pick_thinking(body) is None, body
 
 
 def test_pick_thinking_env_override(monkeypatch):
@@ -448,7 +484,9 @@ def test_malformed_bodies_are_400_and_never_prompt(gateway):
     port, _, log = gateway([[{"text": "x"}]])
     hdr = {"x-claude-code-session-id": "s"}
     bad = [[], None, "x", 5, {"max_tokens": 1, "messages": "x"}, {"messages": []},
-           {"messages": [{"role": "user", "content": "hi"}], "thinking": True}]
+           {"messages": [{"role": "user", "content": "hi"}], "thinking": True},
+           {"messages": [{"role": "user", "content": "hi"}], "output_config": "high"},
+           {"messages": [{"role": "user", "content": "hi"}], "output_config": True}]
     for body in bad:
         st, _, raw = post(port, "/v1/messages", body, hdr)
         assert st == 400 and json.loads(raw)["error"]["type"] == "invalid_request_error", body

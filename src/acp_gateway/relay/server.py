@@ -36,24 +36,29 @@ logger = logging.getLogger(__name__)
 
 MAX_BODY = 64 * 1024 * 1024
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
-_AGY_MODEL = re.compile(r"^gemini-[0-9][\w.-]*$")
+_AGY_REQUESTED = re.compile(r"\A(?:acp-)?(?P<name>gemini-[0-9][A-Za-z0-9._-]{0,120})(?:\[[A-Za-z0-9._-]{1,16}\])?\Z")
 _EFFORT_TO_THINKING = {"none": "low", "minimal": "low", "low": "low", "medium": "medium", "high": "high",
                        "xhigh": "xhigh", "max": "xhigh", "ultra": "xhigh"}
 
 
 def pick_model(requested: Any, default: str) -> str:
-    """The request's model when it is a Gemini id agy offers, else the default. Never a non-Gemini id."""
-    name = str(requested or "").split("[", 1)[0].strip().removeprefix("acp-")
-    return name if _AGY_MODEL.match(name) else default
+    """The request's model when it is a valid ASCII Gemini id agy offers, else the default. Never a non-Gemini id."""
+    if not isinstance(requested, str):
+        return default
+    m = _AGY_REQUESTED.match(requested)
+    return m.group("name") if m else default
 
 
 def pick_thinking(body: dict[str, Any]) -> str | None:
     override = os.environ.get("ACP_GATEWAY_THINKING_LEVEL", "").strip().lower()
     if override:
         return _EFFORT_TO_THINKING.get(override)
-    if (body.get("thinking") or {}).get("type") == "disabled":
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         return "low"
-    return _EFFORT_TO_THINKING.get(str((body.get("output_config") or {}).get("effort") or "").lower())
+    out_cfg = body.get("output_config")
+    effort = out_cfg.get("effort") if isinstance(out_cfg, dict) else None
+    return _EFFORT_TO_THINKING.get(str(effort or "").lower())
 
 
 def group_key(session_id: str, rows: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str:
@@ -77,9 +82,14 @@ def request_problem(body: Any, *, count_only: bool = False) -> str:
         json.dumps(body, ensure_ascii=False).encode("utf-8")
     except UnicodeEncodeError:
         return "text contains an unpaired UTF-16 surrogate"
-    msgs = body.get("messages")
-    if not count_only and (not isinstance(msgs, list) or not msgs or not all(isinstance(m, dict) for m in msgs)):
-        return "messages must be a non-empty list of objects"
+    if not count_only:
+        msgs = body.get("messages")
+        if not isinstance(msgs, list) or not msgs or not all(isinstance(m, dict) for m in msgs):
+            return "messages must be a non-empty list of objects"
+        if body.get("thinking") is not None and not isinstance(body.get("thinking"), dict):
+            return "thinking must be an object"
+        if body.get("output_config") is not None and not isinstance(body.get("output_config"), dict):
+            return "output_config must be an object"
     return ""
 
 

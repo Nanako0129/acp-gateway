@@ -277,13 +277,61 @@ def test_fresh_install_idempotent_rerun_and_backup_rotation(tmp_path):
     # Trigger 4 more distinct edits -> rotation keeps at most 3 backups
     for i in range(4):
         c = json.loads(sb["relay"].read_text(encoding="utf-8"))
-        c["providers"]["agy"]["model"] = f"different-{i}"
+        c["providers"]["agy"]["baseUrl"] = f"http://127.0.0.1:{19000 + i}"
         sb["relay"].write_text(json.dumps(c, indent=2) + "\n", encoding="utf-8")
         r = _run_installer(sb)
         assert r.returncode == 0, r.stderr
     baks_final = sorted((sb["home"] / ".claude").glob("model-relay.json.bak-*-acp-gateway"))
     assert len(baks_final) == 3
     assert all(stat.S_IMODE(p.stat().st_mode) == 0o600 for p in baks_final)
+
+
+def test_rerun_preserves_user_model_models_efforts_and_reconciles_transport(tmp_path):
+    """SEC-06: re-running installer preserves providers.agy model/models/efforts while reconciling transport keys."""
+    sb = _setup_sandbox(tmp_path, fake_codesign_and_sha=True)
+    res1 = _run_installer(sb)
+    assert res1.returncode == 0, res1.stderr
+
+    custom_models = {"hydrogen": "acp-gemini-4-hydrogen[1m]", "neon": "acp-gemini-4-neon[1m]"}
+    custom_efforts = {"hydrogen": ["low", "medium", "high", "xhigh"]}
+    cfg = json.loads(sb["relay"].read_text(encoding="utf-8"))
+    cfg["providers"]["agy"].update(
+        {
+            "model": "acp-gemini-4-hydrogen[1m]",
+            "models": custom_models,
+            "efforts": custom_efforts,
+            "baseUrl": "http://127.0.0.1:9999",
+            "token": "stale-token",
+            "matchModels": ["^stale-"],
+            "retry": True,
+            "fallback": True,
+        }
+    )
+    sb["relay"].write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+    res2 = _run_installer(sb)
+    assert res2.returncode == 0, res2.stderr
+    assert "model-relay provider agy: added" in res2.stdout
+
+    reconciled = json.loads(sb["relay"].read_text(encoding="utf-8"))["providers"]["agy"]
+    assert reconciled["model"] == "acp-gemini-4-hydrogen[1m]"
+    assert reconciled["models"] == custom_models
+    assert reconciled["efforts"] == custom_efforts
+    assert reconciled["baseUrl"] == f"http://127.0.0.1:{TEST_PORT}"
+    assert reconciled["token"] == "acp-gateway-local"
+    assert reconciled["matchModels"] == ["^acp-gemini-"]
+    assert reconciled["retry"] is False
+    assert reconciled["fallback"] is False
+
+    # Subsequent idempotent re-run reports unchanged and creates no new backup
+    baks_before = sorted((sb["home"] / ".claude").glob("model-relay.json.bak-*-acp-gateway"))
+    mtime_before = sb["relay"].stat().st_mtime_ns
+    res3 = _run_installer(sb)
+    assert res3.returncode == 0, res3.stderr
+    assert "model-relay provider agy: unchanged" in res3.stdout
+    assert sb["relay"].stat().st_mtime_ns == mtime_before
+    baks_after = sorted((sb["home"] / ".claude").glob("model-relay.json.bak-*-acp-gateway"))
+    assert baks_after == baks_before
 
 
 def test_cutover_from_legacy_label_removes_legacy_plist_and_keeps_0600_backup(tmp_path):
