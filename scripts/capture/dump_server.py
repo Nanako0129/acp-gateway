@@ -94,9 +94,13 @@ class H(http.server.BaseHTTPRequestHandler):
             state["n"] += 1
             n = state["n"]
         if n > 40:  # runaway guard: refuse instead of feeding a loop
-            out = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": "capture cap"}}).encode()
-            self.send_response(400); self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+            err = {"type": "error", "error": {"type": "invalid_request_error", "message": "capture cap"}}
+            out = json.dumps(err).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
             return
         if self.path.split("?")[0].endswith("/count_tokens"):
             out, kind, ctype = json.dumps({"input_tokens": 1}).encode(), "count_tokens", "application/json"
