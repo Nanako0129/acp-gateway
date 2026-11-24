@@ -62,11 +62,19 @@ GUARD_LOOP_TEXT = "The result of the last step is already in the conversation ab
 _SYS_MSG_RE = re.compile(r"<system-message>\n(.*?)\n</system-message>", re.DOTALL)
 _SYS_MSG_DEDUPE_MIN_CHARS = 200
 _SYS_MSG_OMITTED = "<system-message>(unchanged from earlier in this session)</system-message>"
+_SYS_MSG_LATER = "<system-message>(same text is repeated in full later in this prompt)</system-message>"
 
 
-def dedupe_system_messages(text: str, seen: set[str] | None) -> str:
+def _sys_digests(text: str) -> set[str]:
+    return {hashlib.sha256(m.group(1).encode("utf-8")).hexdigest() for m in _SYS_MSG_RE.finditer(text)
+            if len(m.group(1)) >= _SYS_MSG_DEDUPE_MIN_CHARS}
+
+
+def dedupe_system_messages(text: str, seen: set[str] | None, later: set[str] | frozenset[str] = frozenset()) -> str:
     """Replace large ``<system-message>`` blocks already sent in this ACP session with a one-line placeholder.
 
+    ``later``: digests whose full copy appears later in the same prompt (replay renders ACTIVE_REQUEST and its
+    progress before history, so the copy the model must act on stays complete and history copies point forward).
     Only called on outgoing text rendered for the child (never on matcher inputs), so prefix fingerprints stay exact.
     """
     if seen is None or "<system-message>" not in text:
@@ -77,6 +85,8 @@ def dedupe_system_messages(text: str, seen: set[str] | None) -> str:
         if len(body) < _SYS_MSG_DEDUPE_MIN_CHARS:
             return m.group(0)
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        if digest in later:
+            return _SYS_MSG_LATER
         if digest in seen:
             return _SYS_MSG_OMITTED
         seen.add(digest)
@@ -193,7 +203,7 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
     """Full replay for a fresh session as ACP prompt blocks; the system band rides at the top (no append).
 
     ``fence`` wraps tool output; a conversation passes its own (random once, then stable) so successive replays share
-    a byte-identical prefix and the model provider's prefix cache can hit."""
+    a byte-identical prefix, which is meant to let the model provider's prefix cache hit (not measured)."""
     msgs = [m for m in messages if isinstance(m, dict)]
     fence = fence or "TOOL-OUTPUT-" + secrets.token_hex(4)
     imgs = imgs if imgs is not None else _Images()
@@ -215,16 +225,25 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
         if role == "tool":
             cid = str(m.get("tool_call_id") or "")
             return (f"Tool result for {names.get(cid, 'tool')} (already executed):\n<<<{fence}\n"
-                    f"{dedupe_system_messages(imgs.text(m.get('content')), seen_sys)}\n{fence}>>>")
-        return f"{str(role).capitalize()}: {dedupe_system_messages(imgs.text(m.get('content')), seen_sys)}"
+                    f"{imgs.text(m.get('content'))}\n{fence}>>>")
+        return f"{str(role).capitalize()}: {imgs.text(m.get('content'))}"
 
+    # Pass 1, reading order (image numbers follow it). Pass 2, system-message dedupe: ACTIVE_REQUEST, then its
+    # progress, then history, so the copy the model must act on is the full one and history copies point forward.
     body = [m for m in msgs if m.get("role") != "system"]
+    sent: set[str] = set()
     if last_user >= 0:
         history = [line(m) for m in msgs[:last_user] if m.get("role") != "system"]
-        active = dedupe_system_messages(imgs.text(msgs[last_user].get("content")), seen_sys)
+        active = imgs.text(msgs[last_user].get("content"))
         progress = [line(m) for m in msgs[last_user + 1:] if m.get("role") != "system"]
+        later = frozenset(_sys_digests(active + "".join(progress)))
+        active = dedupe_system_messages(active, sent)
+        progress = [dedupe_system_messages(x, sent) for x in progress]
+        history = [dedupe_system_messages(x, sent, later) for x in history]
     else:
-        history, active, progress = [], "", [line(m) for m in body]
+        history, active, progress = [], "", [dedupe_system_messages(line(m), sent) for m in body]
+    if seen_sys is not None:
+        seen_sys.update(sent)
     parts = []
     if system:
         parts.append("<SYSTEM_INSTRUCTIONS>\n" + "\n\n".join(system) + "\n</SYSTEM_INSTRUCTIONS>")
@@ -263,7 +282,7 @@ class Conversation:
                  step_deadline: float = STEP_DEADLINE_SECONDS, call_deadline: float = DEFAULT_DEADLINE_SECONDS,
                  terminal_tools: frozenset[str] = frozenset(),
                  collect_window: float = COLLECT_WINDOW_SECONDS,
-                 initial_conn: AcpConnection | None = None, cwd: str | None = None):
+                 initial_conn: AcpConnection | None = None, cwd: str | None = None, owns_cwd: bool = False):
         self.key = key
         self._spawn = spawn  # (key, cwd) -> started + initialized AcpConnection
         self.stateless = stateless
@@ -271,7 +290,12 @@ class Conversation:
         self.call_deadline = call_deadline
         self.terminal_tools = frozenset(terminal_tools)
         self.collect_window = max(0.0, float(collect_window))
-        self.cwd = cwd or tempfile.mkdtemp(prefix="acp-gw-cwd-")  # empty dedicated dir
+        # close() deletes the cwd only if this conversation created it, or the caller hands ownership over
+        # (owns_cwd=True, e.g. the pool's pre-warmed temp dir); a caller's own workspace is never deleted.
+        self.cwd = cwd or (initial_conn.cwd if initial_conn is not None else None)
+        self._owns_cwd = self.cwd is None or owns_cwd
+        if self.cwd is None:
+            self.cwd = tempfile.mkdtemp(prefix="acp-gw-cwd-")  # empty dedicated dir
         self.lock = threading.RLock()  # state only; never held while waiting on child
         self._spawn_lock = threading.Lock()  # serialises child spawn (outside self.lock)
         self.events: queue.Queue[tuple[int, str, Any]] = queue.Queue()
@@ -328,15 +352,19 @@ class Conversation:
                 decision.kind, why = "replay", "tool list changed"  # fixed per session
             elif decision.kind == "continue" and f"{model or ''}|{thinking or ''}" != self.model:
                 decision.kind, why = "replay", "model or thinking level changed"
-            elif decision.kind == "replay" and self.view.consumed:
+            if decision.kind == "resume_held" and self.session is not None and not self.handed and self.view.live:
+                # The held calls were already answered and that step is still running: this is a duplicate of the
+                # request being served. Never retire the live step for it (that would fail the original request):
+                # a pool caller (``only=``) moves it to another branch, a direct caller gets an error.
+                if only is not None:
+                    return {"declined": "duplicate", "why": "held calls already answered; step still running"}
+                raise ProviderError("duplicate tool-result request while the step it answers is still running")
+            if decision.kind == "resume_held" and (self.session is None or not self.handed):
+                decision.kind = "replay"  # no session, or the held calls were already answered
+            if decision.kind == "replay" and self.view.consumed and not why:
                 why = ("session retired (" + self.retire_reason + ")" if self.view.retired
                        else explain_mismatch(messages, list(self.view.seen)))
-            if decision.kind == "resume_held" and (self.session is None or not self.handed):
-                decision.kind = "replay"  # no session, or the held calls were already answered (a duplicate request)
             if only is not None and decision.kind not in only:
-                if decision.kind == "replay" and self.view.consumed and not why:
-                    why = ("session retired (" + self.retire_reason + ")" if self.view.retired
-                           else explain_mismatch(messages, list(self.view.seen)))
                 return {"declined": decision.kind, "why": why}
             self.last_used = time.monotonic()
             logger.info("acp-gateway turn: %s%s", decision.kind, f" ({why})" if why else "")
@@ -425,7 +453,8 @@ class Conversation:
             if conn is not None:
                 conn.close()
         finally:
-            shutil.rmtree(self.cwd, ignore_errors=True)
+            if self._owns_cwd:
+                shutil.rmtree(self.cwd, ignore_errors=True)
 
     @property
     def live(self) -> bool:

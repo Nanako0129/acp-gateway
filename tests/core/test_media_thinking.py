@@ -203,16 +203,21 @@ def test_second_degenerate_reply_is_returned_as_is(tmp_path):
 
 
 def test_replays_of_one_conversation_share_a_byte_identical_prefix(tmp_path):
-    conv, log = make_conv(tmp_path, [[{"call": {"name": "fetch", "arguments": {"k": "a"}}}], [{"text": "x"}]])
+    conv, log = make_conv(tmp_path, [[{"call": {"name": "fetch", "arguments": {"k": "a"}}}], [{"text": "x"}],
+                                     [{"text": "y"}]])
     try:
         msgs = [SYS, {"role": "user", "content": "q"}]
         r1 = conv.run(msgs, TOOLS, "m")
         msgs += [asst(r1["tool_calls"]), {"role": "tool", "tool_call_id": r1["tool_calls"][0].id, "content": "A"}]
+        conv.cancel()  # retire: each next request replays on a fresh session
+        conv.run(msgs, TOOLS, "m")
         conv.cancel()
         conv.run(msgs, TOOLS, "m")
         prompts = [e["text"] for e in events(log) if e["ev"] == "prompt"]
-        assert len(prompts) == 2 and conv.fence in prompts[1]
-        assert prompts[1].startswith(prompts[0].split("Use the provided tools")[0][:200])
+        assert len(prompts) == 3 and prompts[1].count(conv.fence) == 2
+        # identical through the end of the fenced tool output, not just the system band
+        end = prompts[1].rindex(conv.fence) + len(conv.fence)
+        assert prompts[2][:end] == prompts[1][:end]
     finally:
         conv.close()
 
@@ -237,3 +242,33 @@ def test_marker_text_in_tool_output_does_not_move_the_image():
     blocks = render_replay(msgs)
     idx = next(i for i, b in enumerate(blocks) if b["type"] == "image")
     assert "<ACTIVE_REQUEST>" in blocks[idx - 1]["text"] and "page says" not in blocks[idx - 1]["text"]
+
+
+def test_replay_keeps_the_active_copy_of_a_repeated_system_message_full():
+    big = "<system-message>\n" + "rule " * 60 + "\n</system-message>"
+    msgs = [SYS, {"role": "user", "content": "first\n" + big}, {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "second\n" + big}]
+    text = "".join(b["text"] for b in render_replay(msgs, seen_sys=set()) if b["type"] == "text")
+    active = text.split("<ACTIVE_REQUEST>")[1].split("</ACTIVE_REQUEST>")[0]
+    history = text.split("<HISTORICAL_CONTEXT>")[1].split("</HISTORICAL_CONTEXT>")[0]
+    assert "rule rule" in active and "rule rule" not in history
+    assert "repeated in full later in this prompt" in history
+
+
+def test_cwd_is_deleted_only_when_owned(tmp_path):
+    import os
+    keep = tmp_path / "workspace"
+    keep.mkdir()
+    conv, _ = make_conv(tmp_path, [[{"text": "x"}]], cwd=str(keep))
+    conv.run([SYS, {"role": "user", "content": "q"}], TOOLS, "m")
+    conv.close()
+    assert keep.is_dir()  # a caller's directory is never deleted
+    handed = tmp_path / "pool-temp"
+    handed.mkdir()
+    conv, _ = make_conv(tmp_path, [[{"text": "x"}]], cwd=str(handed), owns_cwd=True)
+    conv.close()
+    assert not handed.exists()  # ownership handed over (the pool's pre-warmed temp dir)
+    own, _ = make_conv(tmp_path, [[{"text": "x"}]])
+    own_dir = own.cwd
+    own.close()
+    assert not os.path.exists(own_dir)

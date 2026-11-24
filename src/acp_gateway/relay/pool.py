@@ -263,7 +263,7 @@ class BranchPool:
             with self._lock:
                 if conn0 is not None and not conn0.exited:
                     conv = Conversation("guest", self._spawn, stateless=True, step_deadline=self.step_deadline,
-                                        collect_window=self.collect_window, initial_conn=conn0, cwd=cwd0)
+                                        collect_window=self.collect_window, initial_conn=conn0, cwd=cwd0, owns_cwd=True)
                     self._guests.add(conv)
                     released.set()
                     self._opening -= 1  # already counted via _has_child(conv); atomic handoff
@@ -327,7 +327,7 @@ class BranchPool:
                                 conv = Conversation(
                                     f"{group[:12]}-{self._seq}", self._spawn,
                                     step_deadline=self.step_deadline, terminal_tools=self.terminal_tools,
-                                    collect_window=self.collect_window, initial_conn=conn0, cwd=cwd0,
+                                    collect_window=self.collect_window, initial_conn=conn0, cwd=cwd0, owns_cwd=True,
                                 )
                                 self._groups.setdefault(group, []).append(conv)
                                 self._opening -= 1  # now counted via _has_child(conv), no double-count
