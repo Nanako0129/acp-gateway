@@ -251,6 +251,8 @@ def test_sensitive_path_classification_and_denial(tmp_path: Path):
         [".mcp.json"],
         [".env"],
         [".ENV.local"],
+        [".envrc"],
+        [".env-prod"],
         ["ssh", "id_rsa"],
         ["ssh", "id_ed25519_work"],
         ["certs", "server.PEM"],
@@ -265,6 +267,7 @@ def test_sensitive_path_classification_and_denial(tmp_path: Path):
 
     assert is_sensitive_relpath(["src", "main.py"]) is False
     assert is_sensitive_relpath(["docs", "env_notes.md"]) is False
+    assert is_sensitive_relpath(["env_notes.md"]) is False
 
     # Denied when allow_sensitive_paths=False
     with WorkspaceFsHandler([ws], _allow_all_gate(sensitive=False)) as fs:
@@ -345,3 +348,19 @@ def test_byte_caps_utf8_validation_gate_denial_and_cancel(tmp_path: Path):
             fs.read_text_file({"sessionId": "s1", "path": str(big)}, cancel_event=cancel)
         assert exc.value.code in (-32001, -32800)
         assert seen_actions == []
+
+
+def test_lone_utf16_surrogate_in_path_rejected_with_32602(tmp_path: Path):
+    """Finding 5: lone UTF-16 surrogates in path reject with -32602."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    real_ws = os.path.realpath(ws)
+    bad_path = os.path.join(real_ws, "bad\ud800file.txt")
+
+    with WorkspaceFsHandler([ws], _allow_all_gate()) as fs:
+        with pytest.raises(AcpRpcError) as exc:
+            fs.read_text_file({"sessionId": "s1", "path": bad_path})
+        assert exc.value.code == -32602
+        with pytest.raises(AcpRpcError) as exc:
+            fs.write_text_file({"sessionId": "s1", "path": bad_path, "content": "hi"})
+        assert exc.value.code == -32602

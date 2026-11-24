@@ -111,13 +111,25 @@ def test_dangerous_agent_env_vars_rejected_with_32602(tmp_path: Path):
         "NODE_OPTIONS",
         "PERL5OPT",
         "PERL5LIB",
+        "PERL5DB",
+        "PERL5SHELL",
+        "perl5db",
         "RUBYOPT",
         "RUBYLIB",
+        "RUBYPATH",
+        "rubylib",
         "GIT_SSH_COMMAND",
         "GIT_EXEC_PATH",
         "GIT_TEMPLATE_DIR",
         "GIT_CONFIG_PARAMETERS",
         "git_config_global",
+        "GIT_PAGER",
+        "PAGER",
+        "GIT_EDITOR",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "git_pager",
+        "pager",
         "PATH",
         "HOME",
         "SHELL",
@@ -345,3 +357,137 @@ def test_max_terminals_watchdog_cross_session_cancel_and_gate_denial(tmp_path: P
         assert time.monotonic() - t0 < 3.0
         assert exited["signal"] is not None
         wd_term.close_all()
+
+
+def test_no_pre_gate_os_open_oracle_and_cwd_toctou_swap_rejected(tmp_path: Path, monkeypatch):
+    """Finding 1: zero os.open before authorize_action (no existence oracle) & post-gate symlink swap rejected."""
+    import subprocess as sp
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    existing_dir = ws / "existing_dir"
+    existing_dir.mkdir()
+    real_ws = os.path.realpath(ws)
+
+    # (a) When allow_terminal=False, os.open is NEVER called and existing/missing dirs both return -32001.
+    with WorkspaceTerminalHandler([ws], PolicyPermissionGate(allow_terminal=False)) as denied_term:
+        open_calls: list[tuple] = []
+        orig_open = os.open
+
+        def spy_open(*args, **kwargs):
+            open_calls.append((args, kwargs))
+            return orig_open(*args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+        for target in (
+            os.path.join(real_ws, "existing_dir"),
+            os.path.join(real_ws, "no_such_dir"),
+        ):
+            with pytest.raises(AcpRpcError) as exc:
+                denied_term.create(
+                    {
+                        "sessionId": "s1",
+                        "command": sys.executable,
+                        "args": ["-c", "pass"],
+                        "cwd": target,
+                    }
+                )
+            assert exc.value.code == -32001
+        assert open_calls == [], f"os.open was called before gate denial: {open_calls}"
+        monkeypatch.setattr(os, "open", orig_open)
+
+    # (b) Swapping <ws>/swappable to an outside symlink inside authorizer() -> -32002 & Popen never called.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    swappable = ws / "swappable"
+    swappable.mkdir()
+
+    def swap_during_gate(_action) -> bool:
+        swappable.rmdir()
+        os.symlink(outside, swappable)
+        return True
+
+    popen_calls: list[tuple] = []
+    orig_popen = sp.Popen
+
+    def spy_popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return orig_popen(*args, **kwargs)
+
+    gate = PolicyPermissionGate(allow_terminal=True, authorizer=swap_during_gate)
+    with WorkspaceTerminalHandler([ws], gate) as term:
+        monkeypatch.setattr(sp, "Popen", spy_popen)
+        with pytest.raises(AcpRpcError) as exc:
+            term.create(
+                {
+                    "sessionId": "s1",
+                    "command": sys.executable,
+                    "args": ["-c", "pass"],
+                    "cwd": os.path.join(real_ws, "swappable"),
+                }
+            )
+        assert exc.value.code == -32002
+        assert popen_calls == [], "subprocess.Popen must never run after TOCTOU symlink swap"
+
+
+def test_exact_output_byte_limit_not_truncated_and_overflow_truncated(tmp_path: Path):
+    """Finding 3: exact 10/10 bytes sets truncated=False; 11/10 bytes sets truncated=True."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    with WorkspaceTerminalHandler([ws], _allow_term_gate()) as term:
+        # Exact 10/10 bytes -> truncated is False
+        tid_exact = term.create(
+            {
+                "sessionId": "s1",
+                "command": sys.executable,
+                "args": ["-c", "import sys; sys.stdout.buffer.write(b'0123456789')"],
+                "outputByteLimit": 10,
+            }
+        )["terminalId"]
+        assert term.wait_for_exit({"sessionId": "s1", "terminalId": tid_exact})["exitCode"] == 0
+        out_exact = term.output({"sessionId": "s1", "terminalId": tid_exact})
+        assert out_exact["output"] == "0123456789"
+        assert out_exact["truncated"] is False
+
+        # Overflow 11/10 bytes -> truncated is True
+        tid_over = term.create(
+            {
+                "sessionId": "s1",
+                "command": sys.executable,
+                "args": ["-c", "import sys; sys.stdout.buffer.write(b'0123456789X')"],
+                "outputByteLimit": 10,
+            }
+        )["terminalId"]
+        assert term.wait_for_exit({"sessionId": "s1", "terminalId": tid_over})["exitCode"] == 0
+        out_over = term.output({"sessionId": "s1", "terminalId": tid_over})
+        assert out_over["output"] == "123456789X"
+        assert out_over["truncated"] is True
+
+
+def test_lone_utf16_surrogates_rejected_with_32602(tmp_path: Path):
+    """Finding 5: lone UTF-16 surrogates in cwd, command, args, and env reject with -32602."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    real_ws = os.path.realpath(ws)
+
+    with WorkspaceTerminalHandler([ws], _allow_term_gate()) as term:
+        bad_requests = [
+            {"sessionId": "s1", "command": sys.executable, "cwd": f"{real_ws}/\ud800dir"},
+            {"sessionId": "s1", "command": "bad\ud800cmd"},
+            {"sessionId": "s1", "command": sys.executable, "args": ["bad\ud800arg"]},
+            {
+                "sessionId": "s1",
+                "command": sys.executable,
+                "env": [{"name": "BAD\ud800NAME", "value": "ok"}],
+            },
+            {
+                "sessionId": "s1",
+                "command": sys.executable,
+                "env": [{"name": "SAFE_VAR", "value": "bad\ud800val"}],
+            },
+        ]
+        for req in bad_requests:
+            with pytest.raises(AcpRpcError) as exc:
+                term.create(req)
+            assert exc.value.code == -32602

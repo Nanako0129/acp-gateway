@@ -386,7 +386,7 @@ class InteractivePermissionGate:
         if not choice:
             return _reject_or_cancel(options)
         selected: dict[str, Any] | None = None
-        if choice.isdigit():
+        if choice.isascii() and choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(options):
                 selected = options[idx]
@@ -406,20 +406,24 @@ class InteractivePermissionGate:
             job = self._queue.get()
             if job is None:
                 return
-            if self._closed:
-                job.conn.respond_permission(job.request_id, _reject_or_cancel(job.options))
-                continue
-            prompt_text = _format_permission_prompt(
-                job.params,
-                job.options,
-                allow_always_enabled=self.allow_always_enabled,
-            )
-            with self._prompt_lock:
+            try:
                 if self._closed:
                     outcome = _reject_or_cancel(job.options)
                 else:
-                    answer = self._ask(prompt_text)
-                    outcome = self._resolve_choice(answer, job.options)
+                    prompt_text = _format_permission_prompt(
+                        job.params,
+                        job.options,
+                        allow_always_enabled=self.allow_always_enabled,
+                    )
+                    with self._prompt_lock:
+                        if self._closed:
+                            outcome = _reject_or_cancel(job.options)
+                        else:
+                            answer = self._ask(prompt_text)
+                            outcome = self._resolve_choice(answer, job.options)
+            except Exception:  # noqa: BLE001 - worker must never die; fail closed
+                log.exception("interactive permission worker failed; failing closed")
+                outcome = _reject_or_cancel(job.options)
             job.conn.respond_permission(job.request_id, outcome)
 
     def authorize_action(

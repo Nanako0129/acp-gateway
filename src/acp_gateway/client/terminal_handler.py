@@ -47,6 +47,11 @@ _BLOCKED_ENV_EXACT: frozenset[str] = frozenset(
         "GIT_EXEC_PATH",
         "GIT_TEMPLATE_DIR",
         "GIT_CONFIG",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "PAGER",
         "PATH",
         "HOME",
         "SHELL",
@@ -66,11 +71,20 @@ _BLOCKED_ENV_PREFIXES: tuple[str, ...] = (
     "LD_",
     "PYTHON",
     "GIT_CONFIG_",
+    "PERL5",
+    "RUBY",
 )
 
 
 def _has_control_chars(value: str) -> bool:
     return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
+def _ensure_valid_utf8(value: str, field_name: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise AcpRpcError(-32602, f"Invalid {field_name}: not valid UTF-8") from None
 
 
 def _is_blocked_env_name(name: str) -> bool:
@@ -198,6 +212,9 @@ class WorkspaceTerminalHandler:
         self._roots: list[tuple[str, int]] = sorted(
             pinned.items(), key=lambda item: len(item[0]), reverse=True
         )
+        self._default_root_index: int = next(
+            idx for idx, (root_path, _) in enumerate(self._roots) if root_path == self._default_root
+        )
         self._root_fds: dict[str, int] = dict(self._roots)
 
     @property
@@ -213,20 +230,14 @@ class WorkspaceTerminalHandler:
                 raise AcpRpcError(-32002, "Workspace root is no longer available")
             return os.dup(root_fd)
 
-    def _resolve_cwd(
-        self,
-        raw_cwd: Any,
-        cancel_event: threading.Event | None = None,
-    ) -> tuple[str, str]:
-        """Validate ``cwd`` beneath canonical roots by walking every component with ``O_NOFOLLOW``."""
+    def _parse_cwd_target(self, raw_cwd: Any) -> tuple[int, str, list[str], str]:
+        """Phase 1 (pure syntactic validation, zero filesystem I/O): validate ``cwd`` against roots."""
         if raw_cwd is None:
-            # Verify default root FD is still open/valid.
-            fd = self._dup_root_fd(self._default_root)
-            os.close(fd)
-            return self._default_root, self._default_root
+            return self._default_root_index, self._default_root, [], self._default_root
 
         if not isinstance(raw_cwd, str) or not raw_cwd:
             raise AcpRpcError(-32602, "Invalid cwd: must be a non-empty string")
+        _ensure_valid_utf8(raw_cwd, "cwd")
         if _has_control_chars(raw_cwd):
             raise AcpRpcError(-32602, "Invalid cwd: control characters are not allowed")
         if not raw_cwd.startswith("/") or not os.path.isabs(raw_cwd):
@@ -237,23 +248,28 @@ class WorkspaceTerminalHandler:
             raise AcpRpcError(-32602, "Invalid cwd: '.' and '..' segments are not allowed")
 
         norm_cwd = raw_cwd.rstrip("/") or "/"
-        matched_root: str | None = None
-        rel_segments: list[str] = []
-        for root_path, _ in self._roots:
+        for idx, (root_path, _) in enumerate(self._roots):
             if norm_cwd == root_path:
-                matched_root = root_path
-                rel_segments = []
-                break
+                return idx, root_path, [], root_path
             prefix = "/" if root_path == "/" else root_path + "/"
             if norm_cwd.startswith(prefix):
-                matched_root = root_path
                 rel_segments = [s for s in norm_cwd[len(prefix) :].split("/") if s]
-                break
+                canonical_cwd = (
+                    root_path if not rel_segments else os.path.join(root_path, *rel_segments)
+                )
+                return idx, root_path, rel_segments, canonical_cwd
 
-        if matched_root is None:
-            raise AcpRpcError(-32002, "Working directory is outside allowed workspace roots")
+        raise AcpRpcError(-32002, "Working directory is outside allowed workspace roots")
 
-        cur_fd = self._dup_root_fd(matched_root)
+    def _verify_cwd_nofollow(
+        self,
+        root_index: int,
+        rel_segments: Sequence[str],
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        """Phase 2 (post-gate, immediately before Popen): walk every segment with ``O_NOFOLLOW``."""
+        root_path = self._roots[root_index][0]
+        cur_fd = self._dup_root_fd(root_path)
         try:
             for seg in rel_segments:
                 if cancel_event is not None and cancel_event.is_set():
@@ -278,9 +294,6 @@ class WorkspaceTerminalHandler:
         finally:
             os.close(cur_fd)
 
-        resolved = matched_root if not rel_segments else os.path.join(matched_root, *rel_segments)
-        return matched_root, resolved
-
     @staticmethod
     def _validate_agent_env(raw_env: Any) -> dict[str, str]:
         if raw_env is None:
@@ -295,6 +308,8 @@ class WorkspaceTerminalHandler:
             value = item.get("value")
             if not isinstance(name, str) or not isinstance(value, str):
                 raise AcpRpcError(-32602, "Invalid env entry: name and value must be strings")
+            _ensure_valid_utf8(name, "env name")
+            _ensure_valid_utf8(value, "env value")
             if not name or "=" in name or "\x00" in name or "\x00" in value:
                 raise AcpRpcError(-32602, "Invalid env name or value")
             if _is_blocked_env_name(name):
@@ -326,15 +341,15 @@ class WorkspaceTerminalHandler:
                 if not chunk:
                     break
                 with entry.buf_lock:
+                    if len(entry.buf) + len(chunk) > limit:
+                        entry.truncated = True
                     if len(chunk) >= limit:
                         entry.buf[:] = chunk[-limit:]
-                        entry.truncated = True
                     else:
                         entry.buf.extend(chunk)
                         excess = len(entry.buf) - limit
                         if excess > 0:
                             del entry.buf[:excess]
-                            entry.truncated = True
         except (OSError, ValueError):
             pass
         finally:
@@ -396,6 +411,7 @@ class WorkspaceTerminalHandler:
         command = params.get("command")
         if not isinstance(command, str) or not command or "\x00" in command:
             raise AcpRpcError(-32602, "Invalid command")
+        _ensure_valid_utf8(command, "command")
 
         raw_args = params.get("args")
         if raw_args is None:
@@ -404,6 +420,8 @@ class WorkspaceTerminalHandler:
             isinstance(a, str) and "\x00" not in a for a in raw_args
         ):
             args = list(raw_args)
+            for arg in args:
+                _ensure_valid_utf8(arg, "args")
         else:
             raise AcpRpcError(-32602, "Invalid args: must be a list of strings without NUL bytes")
 
@@ -416,7 +434,8 @@ class WorkspaceTerminalHandler:
             byte_limit = min(raw_limit, self._max_output_byte_limit)
 
         agent_env = self._validate_agent_env(params.get("env"))
-        root_path, resolved_cwd = self._resolve_cwd(params.get("cwd"), cancel_event=cancel_event)
+        # Phase 1: pure syntactic cwd validation (zero os.open / filesystem I/O before gate).
+        root_index, root_path, rel_segments, resolved_cwd = self._parse_cwd_target(params.get("cwd"))
 
         action = ActionRequest(
             kind="terminal_create",
@@ -461,6 +480,9 @@ class WorkspaceTerminalHandler:
                 "TMPDIR": tmp_dir,
             }
             child_env.update(agent_env)
+
+            # Phase 2: post-gate O_NOFOLLOW walk immediately before spawning Popen.
+            self._verify_cwd_nofollow(root_index, rel_segments, cancel_event=cancel_event)
 
             try:
                 proc = subprocess.Popen(

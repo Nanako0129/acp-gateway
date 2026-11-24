@@ -362,3 +362,51 @@ def test_interactive_gate_async_permission_nonblocking_and_cancel_race(tmp_path:
         finally:
             release_late.set()
             conn.close()
+
+
+def test_interactive_gate_non_ascii_digit_fails_closed_and_worker_stays_alive(tmp_path: Path):
+    """Finding 6: non-ASCII digit input like '²\\n' fails closed without killing prompt worker."""
+    answers = iter(["²\n", "1\n"])
+    beh = {
+        "prompt_steps": [
+            {
+                "kind": "permission",
+                "id": 710,
+                "params": {
+                    "options": [
+                        {"optionId": "ao", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "ro", "name": "Reject once", "kind": "reject_once"},
+                    ]
+                },
+            },
+            {
+                "kind": "permission",
+                "id": 711,
+                "params": {
+                    "options": [
+                        {"optionId": "ao", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "ro", "name": "Reject once", "kind": "reject_once"},
+                    ]
+                },
+            },
+        ]
+    }
+    with InteractivePermissionGate(prompt_fn=lambda _: next(answers)) as gate:
+        conn = AcpConnection(sys.executable, [FAKE_FULL_AGENT, json.dumps(beh)], str(tmp_path))
+        try:
+            conn.start()
+            conn.initialize(timeout=10.0)
+            sid = conn.request("session/new", {"cwd": conn.cwd, "mcpServers": []}, timeout=10.0)["sessionId"]
+            conn.attach_session(sid, lambda u: None, gate.make_permission_handler(conn))
+            res = conn.request("session/prompt", {"sessionId": sid, "prompt": []}, timeout=10.0)
+            results = res["_meta"]["results"]
+            # First request ("²\n") fails closed to reject_once
+            assert results[0]["resp"]["result"] == {
+                "outcome": {"outcome": "selected", "optionId": "ro"}
+            }
+            # Worker remained alive and handled second request ("1\n") cleanly
+            assert results[1]["resp"]["result"] == {
+                "outcome": {"outcome": "selected", "optionId": "ao"}
+            }
+        finally:
+            conn.close()

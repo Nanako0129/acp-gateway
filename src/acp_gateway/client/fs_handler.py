@@ -48,7 +48,7 @@ _SENSITIVE_EXACT: frozenset[str] = frozenset(
         ".netrc",
     }
 )
-_SENSITIVE_PREFIXES: tuple[str, ...] = (".env.", "id_rsa", "id_ed25519")
+_SENSITIVE_PREFIXES: tuple[str, ...] = (".env", "id_rsa", "id_ed25519")
 _SENSITIVE_SUFFIXES: tuple[str, ...] = (".pem", ".key", ".p12")
 
 
@@ -67,6 +67,13 @@ def is_sensitive_relpath(segments: Sequence[str]) -> bool:
 
 def _has_control_chars(value: str) -> bool:
     return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
+def _ensure_valid_utf8(value: str, field_name: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise AcpRpcError(-32602, f"Invalid {field_name}: not valid UTF-8") from None
 
 
 def _validate_positive_int(value: Any, name: str) -> int:
@@ -163,6 +170,7 @@ class WorkspaceFsHandler:
         """Validate ``raw_path`` and decompose it into ``(canonical_root, segments, relpath)``."""
         if not isinstance(raw_path, str) or not raw_path:
             raise AcpRpcError(-32602, "Invalid path: must be a non-empty string")
+        _ensure_valid_utf8(raw_path, "path")
         if _has_control_chars(raw_path):
             raise AcpRpcError(-32602, "Invalid path: control characters are not allowed")
         if not raw_path.startswith("/") or not os.path.isabs(raw_path):
