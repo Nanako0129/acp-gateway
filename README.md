@@ -60,15 +60,9 @@ PYTHONPATH=src python3.11 -m acp_gateway.client --command <agent-bin> --workspac
 | `ACP_GATEWAY_WARM_STANDBY` | `1` | Pre-warmed initialized ACP children kept ready |
 | `ACP_GATEWAY_THINKING_LEVEL` | *(unset)* | Optional `low\|medium\|high\|xhigh` override |
 
-## Google terms and authentication
+## Architecture & Credential Boundary
 
-This project never handles Google credentials: the official, unmodified `agy_acp_server` logs in and makes every
-Google request itself; the gateway only speaks ACP to it over stdio. Whether a given account may be used this way is
-governed by Google's terms, not by this code. Google's public guidance so far
-([google-antigravity/antigravity-cli#1493](https://github.com/google-antigravity/antigravity-cli/issues/1493)) says
-consumer sign-in (`oauth-personal`) may not be used as a backend worker for third-party agents. The official server
-also offers `gemini-api-key` and enterprise authentication, which Google names as the supported routes for that use.
-Choose an authentication method your terms allow.
+`acp-gateway` is a standard ACP v1 stdio client. It never reads, stores, or forwards upstream credentials, never calls provider API endpoints directly, and never spoofs `clientInfo`: it launches the official, unmodified ACP server binary (`agy_acp_server` or any ACP v1 agent) and speaks JSON-RPC 2.0 over stdio. Authentication and all upstream network requests are handled entirely by the official binary itself.
 
 ## macOS LaunchAgent Installation
 
