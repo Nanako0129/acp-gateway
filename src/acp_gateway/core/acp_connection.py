@@ -53,9 +53,9 @@ MAX_UNATTACHED_UPDATES = 1024
 _STDERR_KEEP_LINES = 200
 _STDERR_LINE_CHARS = 4096
 
-# on_permission(params) -> response result, or None to leave the request pending until
-# ``respond_permission``, ``cancel_session``, or ``$/cancel_request`` answers it.
-PermissionHandler = Callable[[dict[str, Any]], dict[str, Any] | None]
+# on_permission(params) or on_permission(params, request_id) -> response result, or None to leave
+# the request pending until ``respond_permission``, ``cancel_session``, or ``$/cancel_request`` answers it.
+PermissionHandler = Callable[..., dict[str, Any] | None]
 
 
 class AcpError(RuntimeError):
@@ -72,10 +72,11 @@ class AcpProcessExit(AcpError):
 
 
 class AcpRpcError(AcpError):
-    def __init__(self, code: Any, message: str) -> None:
+    def __init__(self, code: Any, message: str, *, data: Any = None) -> None:
         super().__init__(f"ACP error {code}: {message}")
         self.code = code
         self.rpc_message = message
+        self.data = data
 
 
 class _Pending:
@@ -106,8 +107,8 @@ def _is_valid_rpc_id(value: Any) -> bool:
     return isinstance(value, (int, str)) and not isinstance(value, bool)
 
 
-def _classify_handler_cancel_mode(handler: ClientHandler) -> str:
-    """Determine how to pass ``cancel_event`` to ``handler``: ``'kw'``, ``'pos'``, or ``'none'``."""
+def _classify_second_arg_mode(handler: Callable[..., Any], kw_name: str) -> str:
+    """Determine how to pass ``kw_name`` to ``handler``: ``'kw'``, ``'pos'``, or ``'none'``."""
     try:
         sig = inspect.signature(handler)
     except (TypeError, ValueError):
@@ -117,7 +118,7 @@ def _classify_handler_cancel_mode(handler: ClientHandler) -> str:
     has_var_pos = False
     has_var_kw = False
     for p in params:
-        if p.name == "cancel_event" and p.kind in (
+        if p.name == kw_name and p.kind in (
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
             inspect.Parameter.KEYWORD_ONLY,
         ):
@@ -136,6 +137,21 @@ def _classify_handler_cancel_mode(handler: ClientHandler) -> str:
     if has_var_kw:
         return "kw"
     return "none"
+
+
+def _classify_handler_cancel_mode(handler: ClientHandler) -> str:
+    """Determine how to pass ``cancel_event`` to ``handler``: ``'kw'``, ``'pos'``, or ``'none'``."""
+    return _classify_second_arg_mode(handler, "cancel_event")
+
+
+def _classify_permission_mode(handler: PermissionHandler) -> str:
+    """Determine how to pass ``request_id`` to ``on_permission``: ``'kw'``, ``'pos'``, or ``'none'``."""
+    return _classify_second_arg_mode(handler, "request_id")
+
+
+def _cap_enabled(value: Any) -> bool:
+    """ACP capability objects may be advertised as a dict (even ``{}``) or boolean ``True``."""
+    return isinstance(value, dict) or value is True
 
 
 class AcpConnection:
@@ -191,7 +207,7 @@ class AcpConnection:
             collections.OrderedDict()
         )
         self._unattached_update_count = 0
-        self._sessions: dict[str, tuple[Callable[[dict[str, Any]], None], PermissionHandler]] = {}
+        self._sessions: dict[str, tuple[Callable[[dict[str, Any]], None], PermissionHandler, str]] = {}
         self._pending_perms: dict[str, list[Any]] = {}
         # agent->client request_id -> (cancel_event, session_id | None)
         self._active_client_reqs: dict[Any, tuple[threading.Event, str | None]] = {}
@@ -201,12 +217,18 @@ class AcpConnection:
         self._exit_error: AcpProcessExit | None = None
         self._exited = threading.Event()
         self._threads: list[threading.Thread] = []
+        self.protocol_version: Any = None
         self.agent_info: dict[str, Any] = {}
         self.agent_capabilities: dict[str, Any] = {}
+        self.agent_auth_methods: list[dict[str, Any]] = []
         self.supports_images = False
+        self.supports_embedded_context = False
         self.supports_load_session = False
         self.supports_session_close = False
         self.supports_session_resume = False
+        self.supports_session_list = False
+        self.supports_session_delete = False
+        self.supports_additional_directories = False
         self.supports_http_mcp = False
 
     # -- lifecycle -----------------------------------------------------------------
@@ -255,16 +277,27 @@ class AcpConnection:
         }
         result = self.request("initialize", params, timeout=timeout)
         res = result if isinstance(result, dict) else {}
+        self.protocol_version = res.get("protocolVersion")
         self.agent_info = res.get("agentInfo") if isinstance(res.get("agentInfo"), dict) else {}
+        raw_auth = res.get("authMethods")
+        self.agent_auth_methods = (
+            [m for m in raw_auth if isinstance(m, dict)] if isinstance(raw_auth, list) else []
+        )
         caps = res.get("agentCapabilities") if isinstance(res.get("agentCapabilities"), dict) else {}
         self.agent_capabilities = caps
         pcaps = caps.get("promptCapabilities") if isinstance(caps.get("promptCapabilities"), dict) else {}
         mcaps = caps.get("mcpCapabilities") if isinstance(caps.get("mcpCapabilities"), dict) else {}
         scaps = caps.get("sessionCapabilities") if isinstance(caps.get("sessionCapabilities"), dict) else {}
         self.supports_images = bool(pcaps.get("image"))
+        self.supports_embedded_context = bool(pcaps.get("embeddedContext"))
         self.supports_load_session = bool(caps.get("loadSession"))
-        self.supports_session_close = isinstance(scaps.get("close"), dict) or scaps.get("close") is True
-        self.supports_session_resume = isinstance(scaps.get("resume"), dict) or scaps.get("resume") is True
+        self.supports_session_close = _cap_enabled(scaps.get("close"))
+        self.supports_session_resume = _cap_enabled(scaps.get("resume"))
+        self.supports_session_list = _cap_enabled(scaps.get("list"))
+        self.supports_session_delete = _cap_enabled(scaps.get("delete"))
+        self.supports_additional_directories = _cap_enabled(
+            scaps.get("additionalDirectories")
+        ) or _cap_enabled(caps.get("additionalDirectories"))
         self.supports_http_mcp = bool(mcaps.get("http"))
         return result
 
@@ -355,20 +388,22 @@ class AcpConnection:
         except (OSError, ValueError):
             pass
 
-    def respond_permission(self, request_id: Any, outcome: dict[str, Any]) -> bool:
-        """Atomically answer a pending permission request iff it has not already been cancelled."""
+    def _consume_pending_perm(self, request_id: Any) -> bool:
+        """Atomically pop ``request_id`` from ``_pending_perms`` iff still pending."""
         if not _is_valid_rpc_id(request_id):
             return False
-        found = False
         with self._lock:
             for sid, rids in list(self._pending_perms.items()):
                 if request_id in rids:
                     rids.remove(request_id)
                     if not rids:
                         self._pending_perms.pop(sid, None)
-                    found = True
-                    break
-        if not found:
+                    return True
+        return False
+
+    def respond_permission(self, request_id: Any, outcome: dict[str, Any]) -> bool:
+        """Atomically answer a pending permission request iff it has not already been cancelled."""
+        if not self._consume_pending_perm(request_id):
             return False
         self.respond(request_id, outcome)
         return True
@@ -395,9 +430,10 @@ class AcpConnection:
         ``on_update`` runs on the stdout reader thread (and here for the flush) under the dispatch lock, never
         under the connection lock, so order is preserved: it must not block.
         """
+        perm_mode = _classify_permission_mode(on_permission)
         with self._dispatch_lock:
             with self._lock:
-                self._sessions[session_id] = (on_update, on_permission)
+                self._sessions[session_id] = (on_update, on_permission, perm_mode)
                 popped = self._updates.pop(session_id, None)
                 if popped is not None:
                     self._unattached_update_count -= len(popped)
@@ -509,7 +545,11 @@ class AcpConnection:
             if slot is not None:
                 if "error" in msg:
                     err = msg["error"] if isinstance(msg["error"], dict) else {}
-                    slot.error = AcpRpcError(err.get("code"), str(err.get("message", "")))
+                    slot.error = AcpRpcError(
+                        err.get("code"),
+                        str(err.get("message", "")),
+                        data=err.get("data"),
+                    )
                 else:
                     slot.result = msg.get("result")
                 slot.event.set()
@@ -634,11 +674,15 @@ class AcpConnection:
                     res = handler(params)
             except AcpRpcError as exc:
                 code = exc.code if isinstance(exc.code, int) and not isinstance(exc.code, bool) else -32603
-                err: tuple[int, str] | None = (code, getattr(exc, "rpc_message", str(exc)))
+                err: tuple[int, str, Any] | None = (
+                    code,
+                    getattr(exc, "rpc_message", str(exc)),
+                    exc.data,
+                )
                 res = None
             except Exception:  # noqa: BLE001 - never kill worker or leave agent hanging
                 log.exception("ACP client handler %s failed", method)
-                err = (-32603, f"Internal error in {method}")
+                err = (-32603, f"Internal error in {method}", None)
                 res = None
             else:
                 err = None
@@ -647,7 +691,7 @@ class AcpConnection:
             if not still_active or cancelled.is_set():
                 return  # already answered -32800 by $/cancel_request or detached/closed
             if err is not None:
-                self._send_error(request_id, err[0], err[1])
+                self._send_error(request_id, err[0], err[1], data=err[2])
             else:
                 self.respond(request_id, res if res is not None else {})
 
@@ -700,8 +744,25 @@ class AcpConnection:
         if entry is None:
             self.respond(request_id, CANCELLED_OUTCOME)
             return
+        perm_handler = entry[1]
+        perm_mode = entry[2]
         try:
-            result = entry[1](params)
+            if perm_mode == "kw":
+                result = perm_handler(params, request_id=request_id)
+            elif perm_mode == "pos":
+                result = perm_handler(params, request_id)
+            else:
+                result = perm_handler(params)
+        except AcpRpcError as exc:
+            if self._consume_pending_perm(request_id):
+                code = exc.code if isinstance(exc.code, int) and not isinstance(exc.code, bool) else -32603
+                self._send_error(
+                    request_id,
+                    code,
+                    getattr(exc, "rpc_message", str(exc)),
+                    data=exc.data,
+                )
+            return
         except Exception:  # noqa: BLE001 - a broken gate must fail closed, not hang the child
             log.exception("permission handler failed; answering cancelled")
             result = CANCELLED_OUTCOME

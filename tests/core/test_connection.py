@@ -424,3 +424,180 @@ def test_unattached_updates_buffer_is_strictly_capped():
     conn.attach_session("s-99", got.append, lambda p: None)
     assert len(got) == 20
     assert conn._unattached_update_count == sum(len(q) for q in conn._updates.values())
+
+
+# ---- S2 Mode B core seam tests -----------------------------------------------
+
+def test_rpc_error_data_propagated_from_client_handler(tmp_path):
+    """Core seam: AcpRpcError.data is forwarded in JSON-RPC error responses."""
+    log = tmp_path / "agy.log"
+
+    def fail_with_data(params):
+        raise AcpRpcError(-32002, "Unknown terminal", data={"terminalId": "t-missing"})
+
+    behaviour = {
+        "log": str(log),
+        "script": [[
+            {"client_req": {"method": "fs/read_text_file", "params": {"path": "/a"}}},
+            {"text": "done"},
+        ]],
+    }
+    conn = AcpConnection(
+        sys.executable,
+        [FAKE_AGY, json.dumps(behaviour)],
+        str(tmp_path),
+        client_handlers={"fs/read_text_file": fail_with_data},
+    )
+    try:
+        conn.start()
+        conn.initialize()
+        sess = new_session(
+            conn,
+            mcp_server={"name": "m", "type": "http", "url": "http://127.0.0.1:1/m"},
+            gate=PermissionGate("m", frozenset()),
+        )
+        assert sess.prompt("go", timeout=15.0).stop_reason == "end_turn"
+        resps = [e["resp"] for e in _events(log) if e["ev"] == "client_resp"]
+        assert resps[0]["error"]["code"] == -32002
+        assert resps[0]["error"]["data"] == {"terminalId": "t-missing"}
+    finally:
+        conn.close()
+
+
+def test_permission_handler_signature_dispatch_pos_kw_and_legacy(connect):
+    """Core seam: on_permission supports 1-arg (Mode A), 2-arg positional, and request_id kwarg."""
+    # Positional 2-arg handler returning None then resolving via respond_permission
+    conn = connect({
+        "permission": {
+            "toolCall": {"toolCallId": "t1"},
+            "options": [{"optionId": "ao", "name": "Allow", "kind": "allow_once"}],
+        },
+    })
+    sid = conn.request("session/new", {"cwd": conn.cwd, "mcpServers": []}, timeout=10)["sessionId"]
+    got_rid = {}
+    ready = threading.Event()
+
+    def pos_handler(params, rid):
+        got_rid["rid"] = rid
+        ready.set()
+        return None
+
+    conn.attach_session(sid, lambda u: None, pos_handler)
+    out = {}
+    t = threading.Thread(
+        target=lambda: out.update(conn.request("session/prompt", {"sessionId": sid, "prompt": []}, timeout=10))
+    )
+    t.start()
+    assert ready.wait(5.0)
+    assert got_rid["rid"] == 900
+    assert conn.respond_permission(got_rid["rid"], {"outcome": {"outcome": "selected", "optionId": "ao"}}) is True
+    t.join(10.0)
+    assert out["_meta"]["permissionResponse"]["result"] == {"outcome": {"outcome": "selected", "optionId": "ao"}}
+
+    # Keyword request_id handler
+    conn2 = connect({
+        "permission": {
+            "toolCall": {"toolCallId": "t2"},
+            "options": [{"optionId": "ro", "name": "Reject", "kind": "reject_once"}],
+        },
+    })
+    sid2 = conn2.request("session/new", {"cwd": conn2.cwd, "mcpServers": []}, timeout=10)["sessionId"]
+    seen_kw = {}
+
+    def kw_handler(params, *, request_id):
+        seen_kw["rid"] = request_id
+        return {"outcome": {"outcome": "selected", "optionId": "ro"}}
+
+    conn2.attach_session(sid2, lambda u: None, kw_handler)
+    res2 = conn2.request("session/prompt", {"sessionId": sid2, "prompt": []}, timeout=10)
+    assert seen_kw["rid"] == 900
+    assert res2["_meta"]["permissionResponse"]["result"] == {"outcome": {"outcome": "selected", "optionId": "ro"}}
+
+
+def test_permission_handler_rpc_error_returns_32602_and_avoids_double_answer_on_cancel(connect):
+    """Core seam: AcpRpcError from on_permission returns JSON-RPC error iff still pending."""
+    conn = connect({
+        "permission": {"toolCall": {"toolCallId": "t1"}, "options": [{"optionId": "x", "kind": "bad"}]},
+    })
+    sid = conn.request("session/new", {"cwd": conn.cwd, "mcpServers": []}, timeout=10)["sessionId"]
+
+    def bad_opts(params, request_id):
+        raise AcpRpcError(-32602, "Invalid permission options", data={"bad": True})
+
+    conn.attach_session(sid, lambda u: None, bad_opts)
+    res = conn.request("session/prompt", {"sessionId": sid, "prompt": []}, timeout=10)
+    err = res["_meta"]["permissionResponse"]["error"]
+    assert err["code"] == -32602
+    assert err["data"] == {"bad": True}
+
+    # Concurrent cancel race: cancel_session answers first -> AcpRpcError must NOT double-answer
+    conn2 = connect({
+        "permission": {"toolCall": {"toolCallId": "t2"}, "options": []},
+        "wait_cancel": True,
+    })
+    sid2 = conn2.request("session/new", {"cwd": conn2.cwd, "mcpServers": []}, timeout=10)["sessionId"]
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    def racing_handler(params, request_id):
+        entered.set()
+        proceed.wait(5.0)
+        raise AcpRpcError(-32602, "Late invalid options")
+
+    conn2.attach_session(sid2, lambda u: None, racing_handler)
+    out = {}
+    t = threading.Thread(
+        target=lambda: out.update(conn2.request("session/prompt", {"sessionId": sid2, "prompt": []}, timeout=10))
+    )
+    t.start()
+    assert entered.wait(5.0)
+    conn2.cancel_session(sid2)
+    proceed.set()
+    t.join(10.0)
+    assert out["stopReason"] == "cancelled"
+    answers = [m for m in dump(conn2)["log"] if m.get("id") == 900]
+    assert len(answers) == 1
+    assert answers[0]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+
+def test_initialize_records_extended_capability_flags(tmp_path):
+    """Core seam: initialize() records protocol_version, authMethods, and extended capabilities."""
+    agent = tmp_path / "cap_agent.py"
+    agent.write_text(
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    if msg.get('method') == 'initialize':\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'protocolVersion': 1,\n"
+        "            'agentInfo': {'name': 'cap-test', 'version': '1.0'},\n"
+        "            'authMethods': [{'id': 'oauth', 'name': 'OAuth'}],\n"
+        "            'agentCapabilities': {\n"
+        "                'loadSession': True,\n"
+        "                'promptCapabilities': {'image': True, 'embeddedContext': True},\n"
+        "                'mcpCapabilities': {'http': True},\n"
+        "                'sessionCapabilities': {\n"
+        "                    'close': {}, 'resume': {}, 'list': {}, 'delete': {}, 'additionalDirectories': {}\n"
+        "                },\n"
+        "            },\n"
+        "        }}) + '\\n')\n"
+        "        sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    conn = AcpConnection(sys.executable, [str(agent)], str(tmp_path))
+    try:
+        conn.start()
+        conn.initialize(timeout=10.0)
+        assert conn.protocol_version == 1
+        assert conn.agent_auth_methods == [{"id": "oauth", "name": "OAuth"}]
+        assert conn.supports_images is True
+        assert conn.supports_embedded_context is True
+        assert conn.supports_load_session is True
+        assert conn.supports_session_close is True
+        assert conn.supports_session_resume is True
+        assert conn.supports_session_list is True
+        assert conn.supports_session_delete is True
+        assert conn.supports_additional_directories is True
+        assert conn.supports_http_mcp is True
+    finally:
+        conn.close()
