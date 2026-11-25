@@ -7,7 +7,7 @@ Environment (all optional):
   ACP_GATEWAY_PIN_VERSION     1.5.2  (the version the canary matrix passed on; anything else is refused)
   ACP_GATEWAY_MODEL           gemini-4-hydrogen-medium
   ACP_GATEWAY_MAX_CHILDREN    6
-  ACP_GATEWAY_STEP_DEADLINE   240  (seconds without agy activity before a step fails; agy retries 503s silently)
+  ACP_GATEWAY_STEP_DEADLINE   480  (seconds without agy activity before a step fails; agy retries 503s silently)
   ACP_GATEWAY_TERMINAL_TOOLS  SubagentHandback  (comma-separated tools that end a turn without a tool_result)
   ACP_GATEWAY_COLLECT_WINDOW  0.05  (seconds to collect parallel MCP tool calls per step)
   ACP_GATEWAY_WARM_STANDBY    1  (pre-warmed initialized agy children kept ready within MAX_CHILDREN)
@@ -86,7 +86,7 @@ def main() -> None:
             force_file_storage=True,
         ),
         max_children=int(os.environ.get("ACP_GATEWAY_MAX_CHILDREN", "6")),
-        step_deadline=float(os.environ.get("ACP_GATEWAY_STEP_DEADLINE", "240")),
+        step_deadline=float(os.environ.get("ACP_GATEWAY_STEP_DEADLINE", "480")),
         terminal_tools=terminal_tools,
         collect_window=float(os.environ.get("ACP_GATEWAY_COLLECT_WINDOW", "0.05")),
         warm_standby=int(os.environ.get("ACP_GATEWAY_WARM_STANDBY", "1")),

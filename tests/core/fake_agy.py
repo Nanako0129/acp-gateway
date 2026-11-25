@@ -80,6 +80,7 @@ def mcp_call(server, name, arguments):
 def run_prompt(rid, sid, text, steps, token):
     server = state["sessions"][sid]
     last = ""
+    result_usage = None
     for step in steps:
         if token["cancelled"]:
             return
@@ -114,6 +115,8 @@ def run_prompt(rid, sid, text, steps, token):
             sys.stderr.flush()
         elif "usage" in step:
             update(sid, {"sessionUpdate": "usage_update", **step["usage"]})
+        elif "result_usage" in step:
+            result_usage = step["result_usage"]
         elif "rpc_error" in step:
             err = step["rpc_error"]
             with lock:
@@ -150,7 +153,10 @@ def run_prompt(rid, sid, text, steps, token):
         if token["done"]:
             return
         token["done"] = True
-    emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+    res_payload = {"stopReason": "end_turn"}
+    if result_usage is not None:
+        res_payload["usage"] = result_usage
+    emit({"jsonrpc": "2.0", "id": rid, "result": res_payload})
 
 
 def main():

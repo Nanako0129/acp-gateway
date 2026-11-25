@@ -114,6 +114,10 @@ def _pos_int(val: Any) -> int | None:
     return val if isinstance(val, int) and not isinstance(val, bool) and val > 0 else None
 
 
+def _nonneg_int(val: Any) -> int | None:
+    return val if isinstance(val, int) and not isinstance(val, bool) and val >= 0 else None
+
+
 def to_message(result: dict[str, Any], model: str, input_tokens: int) -> dict[str, Any]:
     """Conversation result -> Anthropic message object."""
     content: list[dict[str, Any]] = []
@@ -123,12 +127,26 @@ def to_message(result: dict[str, Any], model: str, input_tokens: int) -> dict[st
         content.append({"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments or {}})
     stop = "tool_use" if result.get("tool_calls") else STOP_REASON.get(result.get("finish_reason") or "stop", "end_turn")
     reported = result.get("usage") if isinstance(result.get("usage"), dict) else {}
-    in_tok = _pos_int(reported.get("input_tokens")) or _pos_int(reported.get("used"))
+    cr_tok = _nonneg_int(reported.get("cache_read_input_tokens"))
+    cw_tok = _nonneg_int(reported.get("cache_creation_input_tokens"))
+    raw_in = _nonneg_int(reported.get("input_tokens"))
+    if raw_in is not None and (raw_in > 0 or (cr_tok or 0) > 0 or (cw_tok or 0) > 0):
+        in_tok: int | None = raw_in
+    else:
+        in_tok = _pos_int(reported.get("used"))
     out_tok = _pos_int(reported.get("output_tokens"))
-    usage = {
+    if out_tok is None:
+        out_tok = estimate_tokens(content)
+        if result.get("reasoning"):
+            out_tok += estimate_tokens(result["reasoning"])
+    usage: dict[str, int] = {
         "input_tokens": in_tok if in_tok is not None else input_tokens,
-        "output_tokens": out_tok if out_tok is not None else estimate_tokens(content),
+        "output_tokens": out_tok,
     }
+    if cr_tok is not None:
+        usage["cache_read_input_tokens"] = cr_tok
+    if cw_tok is not None:
+        usage["cache_creation_input_tokens"] = cw_tok
     # A fresh id per response: clients merge assistant messages that share an id.
     return {"id": "msg_" + uuid.uuid4().hex, "type": "message", "role": "assistant", "model": model,
             "content": content, "stop_reason": stop, "stop_sequence": None, "usage": usage}
@@ -139,8 +157,9 @@ def sse(message: dict[str, Any]) -> bytes:
     def ev(obj: dict[str, Any]) -> str:
         return f"event: {obj['type']}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-    start = dict(message, content=[], stop_reason=None,
-                 usage={"input_tokens": message["usage"]["input_tokens"], "output_tokens": 0})
+    start_usage = {k: v for k, v in message["usage"].items() if k != "output_tokens"}
+    start_usage["output_tokens"] = 0
+    start = dict(message, content=[], stop_reason=None, usage=start_usage)
     out = [ev({"type": "message_start", "message": start})]
     for i, block in enumerate(message["content"]):
         if block["type"] == "text":

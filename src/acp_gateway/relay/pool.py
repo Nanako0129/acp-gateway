@@ -30,7 +30,7 @@ DEFAULT_TERMINAL_TOOLS = frozenset({"SubagentHandback"})
 
 class BranchPool:
     def __init__(self, spawn: Callable[[str, str], AcpConnection], *, max_children: int = 6,
-                 idle_ttl: float = 600.0, wait_s: float = 30.0, step_deadline: float = 240.0,
+                 idle_ttl: float = 600.0, wait_s: float = 30.0, step_deadline: float = 480.0,
                  terminal_tools: frozenset[str] = DEFAULT_TERMINAL_TOOLS,
                  collect_window: float = 0.05, warm_standby: int = 0) -> None:
         self._spawn = spawn
