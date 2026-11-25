@@ -137,8 +137,9 @@ def _extract_pinned_instructions(
     cannot drop CLAUDE.md, MEMORY.md, or SessionStart plugin rules, and so they sit in ``<SYSTEM_INSTRUCTIONS>``
     rather than under the reference-only ``<HISTORICAL_CONTEXT>`` banner.
 
-    Tool rows only inspect standalone content parts (matching ``adapter.to_openai``'s attachment of harness
-    reminders), never tool output strings, so source code read by tools cannot inject system instructions.
+    Tool rows only inspect content parts explicitly marked with ``_acp_harness: True`` (matching ``adapter.to_openai``'s
+    attachment of sibling harness reminders and folded system messages), never ``tool_result`` payload parts or raw tool
+    output strings, so data returned by tools cannot inject system instructions.
     Caller message dicts and lists are never mutated.
     """
     seen_digests: set[str] = set()
@@ -197,6 +198,9 @@ def _extract_pinned_instructions(
             changed = False
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
+                    if role == "tool" and not part.get("_acp_harness"):
+                        kept_parts.append(part)
+                        continue
                     raw_t = str(part.get("text") or "")
                     st = _match_standalone_pinned(raw_t)
                     if st is not None:
@@ -794,7 +798,12 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
         active_cap=active_cap, omit_note=omit_note,
     )
     if seen_sys is not None:
-        seen_sys.update(sent | pinned_digests)
+        surviving_pinned = (
+            pinned_digests & _sys_digests("\n\n".join(sys_texts))
+            if pinned_digests and sys_texts
+            else set()
+        )
+        seen_sys.update(sent | surviving_pinned)
     logger.warning(
         "acp-gateway replay trimmed: %d -> %d UTF-8 bytes (kept %d/%d history msgs)",
         orig_bytes, _utf8_bytes(final_text), len(kept_history), len(raw_history),
@@ -1134,16 +1143,23 @@ class Conversation:
     # ---- callbacks (connection reader / MCP HTTP threads) -----------------------------------------------------
 
     def _on_call(self, gen: int, call: ParkedCall) -> None:
-        if gen != self.gen:
+        with self.lock:
+            if gen != self.gen:
+                retired, guarded, loop = True, False, False
+            elif (call.name, canonical_args(call.arguments)) in self.guard:
+                self.guard_refusals += 1
+                retired, guarded, loop = False, True, self.guard_refusals >= 2
+            else:
+                self.last_activity = time.monotonic()
+                retired, guarded, loop = False, False, False
+        if retired:
             call.answer("session retired", is_error=True)  # straggler from a retired session
             return
-        if (call.name, canonical_args(call.arguments)) in self.guard:
-            self.guard_refusals += 1
+        if guarded:
             call.answer(GUARD_TEXT, is_error=True)  # replay guard: never handed out twice
-            if self.guard_refusals >= 2:
+            if loop:
                 self.events.put((gen, "guard-loop", None))
             return
-        self.last_activity = time.monotonic()
         self.events.put((gen, "call", call))
 
     def _on_deadline(self, gen: int, call: ParkedCall) -> None:  # before child sees the isError
@@ -1158,26 +1174,34 @@ class Conversation:
             session = self.session if self.gen == gen else None
         if session is None:
             return
+        drained: list[dict[str, Any]] = []
         while True:
             try:
-                u = session.updates.get_nowait()
+                drained.append(session.updates.get_nowait())
             except queue.Empty:
+                break
+        if not drained:
+            return
+        now = time.monotonic()
+        with self.lock:
+            if self.gen != gen:
                 return
-            self.last_activity = time.monotonic()
-            kind = u.get("sessionUpdate")
-            content = u.get("content") or {}
-            if kind == "agent_message_chunk" and content.get("type", "text") == "text":
-                self.text.append(str(content.get("text") or ""))
-            elif kind == "agent_thought_chunk" and content.get("type", "text") == "text":
-                self.reasoning.append(str(content.get("text") or ""))
-            elif kind == "usage_update":
-                parsed = _parse_usage(u)
-                if parsed:
-                    usage: dict[str, int] = dict(self.usage or {})
-                    usage.update(parsed)
-                    self.usage = usage
-                    if usage.get("used", 0) > 0:
-                        self._last_used_tokens = usage["used"]
+            self.last_activity = now
+            for u in drained:
+                kind = u.get("sessionUpdate")
+                content = u.get("content") or {}
+                if kind == "agent_message_chunk" and content.get("type", "text") == "text":
+                    self.text.append(str(content.get("text") or ""))
+                elif kind == "agent_thought_chunk" and content.get("type", "text") == "text":
+                    self.reasoning.append(str(content.get("text") or ""))
+                elif kind == "usage_update":
+                    parsed = _parse_usage(u)
+                    if parsed:
+                        usage: dict[str, int] = dict(self.usage or {})
+                        usage.update(parsed)
+                        self.usage = usage
+                        if usage.get("used", 0) > 0:
+                            self._last_used_tokens = usage["used"]
 
     def _record_step_duration(self) -> None:
         self._prompt_steps += 1
@@ -1216,17 +1240,19 @@ class Conversation:
             u["cache_creation_input_tokens"] = 0
         return u or None
 
-    def _build_end_usage(self, prompt_result: dict[str, Any] | None) -> dict[str, int] | None:
+    def _build_end_usage(self, prompt_result: dict[str, Any] | None, *, extra_steps: int = 0) -> dict[str, int] | None:
         """Final-step usage from ``session/prompt`` result combined with the step's ``usage_update``.
 
         For single-step prompts, ``result["usage"]`` is exact and returned verbatim. For multi-step prompts
-        (parked MCP tool calls followed by ``end_turn``), ACP reports cumulative totals across all internal
-        LLM calls while ``usage_update.used`` reports the final step's single-call context footprint: scaling
-        the cumulative input/cache split into ``usage_update.used`` preserves exact context-% and cache hit
-        ratio without N-fold inflation, and scaling ``outputTokens`` by step-duration share keeps ``tok/s``
-        aligned with the prompt's true output rate.
+        (parked MCP tool calls or guard-refused duplicate calls followed by ``end_turn``), ACP reports cumulative
+        totals across all internal LLM calls while ``usage_update.used`` reports the final step's single-call
+        context footprint: scaling the cumulative input/cache split into ``usage_update.used`` (or the session's
+        prior ``_last_used_tokens`` if the final step emitted no ``usage_update``) preserves exact context-% and
+        cache hit ratio without N-fold inflation, and scaling ``outputTokens``/``thoughtTokens`` by step-duration
+        share keeps ``tok/s`` aligned with the prompt's true output rate.
         """
         self._record_step_duration()
+        effective_steps = self._prompt_steps + max(0, extra_steps)
         u: dict[str, int] = dict(self.usage or {})
         step_used = u.get("used") if (u.get("used") or 0) > 0 else None
         p = _parse_usage(prompt_result.get("usage") if isinstance(prompt_result, dict) else None)
@@ -1246,42 +1272,57 @@ class Conversation:
 
         if step_used is not None:
             self._last_used_tokens = step_used
-        elif self._prompt_steps <= 1 and p_tot is not None and p_tot > 0:
+        elif effective_steps <= 1 and p_tot is not None and p_tot > 0:
             self._last_used_tokens = p_tot
 
         sum_in = (p_in + (p_cr or 0) + (p_cw or 0)) if p_in is not None else None
         if sum_in is not None and sum_in > 0:
             self._cache_read_ratio = min(1.0, max(0.0, (p_cr or 0) / sum_in))
 
+        scale_target = step_used if step_used is not None else (
+            self._last_used_tokens if effective_steps >= 2 else None
+        )
         is_multi_inflated = (
-            self._prompt_steps >= 2
-            and step_used is not None
+            effective_steps >= 2
+            and scale_target is not None
             and sum_in is not None
-            and sum_in > step_used
+            and sum_in > 0
+            and (sum_in + (p_out or 0)) > scale_target
         )
         if not is_multi_inflated:
             u.update(p)
             return u or None
 
-        assert step_used is not None and sum_in is not None
+        assert scale_target is not None and sum_in is not None
+        if effective_steps > len(self._prompt_step_durations):
+            share = 1.0 / effective_steps
+        else:
+            total_dur = sum(self._prompt_step_durations)
+            share = (self._prompt_step_durations[-1] / total_dur) if total_dur > 0 else (1.0 / effective_steps)
+
         step_out = 0
+        out_ratio = share
         if p_out is not None:
             if p_out > 0:
-                total_dur = sum(self._prompt_step_durations)
-                share = (self._prompt_step_durations[-1] / total_dur) if total_dur > 0 else (1.0 / self._prompt_steps)
                 step_out = max(1, min(p_out, int(round(p_out * share))))
-                if step_used > 1:
-                    step_out = min(step_out, step_used - 1)
+                if scale_target > 1:
+                    step_out = min(step_out, scale_target - 1)
+                out_ratio = step_out / p_out
+            else:
+                out_ratio = 0.0
             u["output_tokens"] = step_out
 
-        step_in_budget = max(0, step_used - step_out)
+        step_in_budget = max(0, scale_target - step_out)
         step_cr = max(0, min(step_in_budget, int(round(step_in_budget * ((p_cr or 0) / sum_in)))))
         step_cw = max(0, min(step_in_budget - step_cr, int(round(step_in_budget * ((p_cw or 0) / sum_in)))))
         u["input_tokens"] = step_in_budget - step_cr - step_cw
         u["cache_read_input_tokens"] = step_cr
         u["cache_creation_input_tokens"] = step_cw
         if p_th is not None:
-            u["thought_tokens"] = p_th
+            if p_out is not None:
+                u["thought_tokens"] = max(0, min(step_out, int(round(p_th * out_ratio))))
+            else:
+                u["thought_tokens"] = max(0, min(p_th, int(round(p_th * share))))
         return u or None
 
     def _fail(self, gen: int, reason: str, exc: ProviderError, *, drop_conn: bool = False) -> ProviderError:
@@ -1360,11 +1401,12 @@ class Conversation:
                         logger.info("acp-gateway: degenerate final reply (%d chars); asking once more", len(reply))
                         self._start_prompt(gen, [{"type": "text", "text": NUDGE_TEXT.format(reply=reply.strip())}])
                         continue
+                    guard_refusals = self.guard_refusals
                     self.guard, self.guard_refusals = set(), 0
                     self.view = view_after(messages)
                     if self.server is not None:
                         self.server.clear_completed()
-                    end_usage = self._build_end_usage(payload.result)
+                    end_usage = self._build_end_usage(payload.result, extra_steps=guard_refusals)
                     text, reasoning = "".join(self.text), "".join(self.reasoning)
                 return {"text": text, "reasoning": reasoning, "tool_calls": [],
                         "finish_reason": payload.finish_reason, "usage": end_usage}

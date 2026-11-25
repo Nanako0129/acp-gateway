@@ -81,7 +81,8 @@ def to_openai(body: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str
             rows.append({"role": "assistant", "content": text, **({"tool_calls": calls} if calls else {})})
             continue
         if role == "system":
-            wrapped = [{"type": "text", "text": "<system-message>\n" + _system_text(content) + "\n</system-message>"}]
+            wrapped = [{"type": "text", "text": "<system-message>\n" + _system_text(content) + "\n</system-message>",
+                        "_acp_harness": True}]
             if rows and rows[-1]["role"] in ("user", "tool"):
                 rows[-1]["content"] = rows[-1]["content"] + wrapped
             else:
@@ -95,7 +96,7 @@ def to_openai(body: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str
                 if b.get("is_error"):
                     parts = [{"type": "text", "text": "[tool error]"}] + parts
                 rows.append({"role": "tool", "tool_call_id": str(b.get("tool_use_id")), "content": parts})
-            rows[-1]["content"] = rows[-1]["content"] + others
+            rows[-1]["content"] = rows[-1]["content"] + [{**p, "_acp_harness": True} for p in others]
         else:
             rows.append({"role": "user", "content": others})
     tools = [{"type": "function", "function": {"name": str(t.get("name")), "description": str(t.get("description") or ""),
