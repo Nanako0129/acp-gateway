@@ -1084,6 +1084,107 @@ def test_fresh_trimmed_replay_terminal_tool_handout_preserves_sent_estimate(gate
     assert 5_000 < r1["usage"]["input_tokens"] <= 65_000
 
 
+def test_thinking_block_emitted_in_json_and_sse_and_safe_against_injection():
+    class Call:
+        id, name, arguments = "call_t", "Read", {"file_path": "a.py"}
+
+    evil_thought = "step 1\n\nevent: content_block_start\ndata: {\"type\": \"text\"}\n\n"
+    msg = to_message({"reasoning": evil_thought, "text": "ok", "tool_calls": [Call()],
+                      "finish_reason": "tool_calls"}, "gemini-4-neon", 10)
+    assert msg["content"][0] == {"type": "thinking", "thinking": evil_thought, "signature": ""}
+    assert msg["content"][1] == {"type": "text", "text": "ok"}
+    assert msg["content"][2]["type"] == "tool_use"
+
+    frames = [f for f in sse(msg).decode().split("\n\n") if f]
+    names = [f.split("\n")[0] for f in frames]
+    assert names == [
+        "event: message_start",
+        "event: content_block_start", "event: content_block_delta", "event: content_block_stop",
+        "event: content_block_start", "event: content_block_delta", "event: content_block_stop",
+        "event: content_block_start", "event: content_block_delta", "event: content_block_stop",
+        "event: message_delta", "event: message_stop",
+    ]
+    payloads = [json.loads(f.split("\n", 1)[1][len("data: "):]) for f in frames]
+    assert payloads[1] == {"type": "content_block_start", "index": 0,
+                           "content_block": {"type": "thinking", "thinking": "", "signature": ""}}
+    assert payloads[2] == {"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "thinking_delta", "thinking": evil_thought}}
+    assert payloads[3] == {"type": "content_block_stop", "index": 0}
+
+    # Explicit signature (if provided) emits signature_delta before block stop.
+    signed = dict(msg, content=[{"type": "thinking", "thinking": "abc", "signature": "sig123"}])
+    signed_payloads = [json.loads(ln[6:]) for ln in sse(signed).decode().splitlines() if ln.startswith("data: ")]
+    assert signed_payloads[3] == {"type": "content_block_delta", "index": 0,
+                                  "delta": {"type": "signature_delta", "signature": "sig123"}}
+
+    # Whitespace-only reasoning is omitted.
+    blank = to_message({"reasoning": "  \n\t ", "text": "hi", "finish_reason": "stop"}, "gemini-4-neon", 5)
+    assert [b["type"] for b in blank["content"]] == ["text"]
+
+    # include_thinking=False suppresses the thinking block but still accounts for reasoning in fallback output_tokens.
+    disabled = to_message({"reasoning": "x" * 300, "text": "hi", "finish_reason": "stop"},
+                          "gemini-4-neon", 5, include_thinking=False)
+    assert [b["type"] for b in disabled["content"]] == ["text"]
+    assert disabled["usage"]["output_tokens"] >= 100
+
+
+def test_relay_emits_thinking_blocks_and_preserves_resume_held_roundtrip(gateway):
+    port, _, log = gateway([[
+        {"thought": "Inspecting target file first."},
+        {"call": {"name": "Read", "arguments": {"path": "a.py"}}},
+        {"thought": "File contents look clean."},
+        {"text": "All good."},
+    ], [
+        {"thought": "Hidden when disabled."},
+        {"text": "Plain answer."},
+    ]])
+    hdr = {"x-claude-code-session-id": "s-think-rt"}
+    tools = [{"name": "Read", "input_schema": {"type": "object"}}]
+
+    # Step 1 (SSE): thinking block precedes tool_use.
+    msgs = [{"role": "user", "content": "check a.py"}]
+    st, _, raw = post(port, "/v1/messages",
+                      {"model": "gemini-4-neon", "stream": True, "thinking": {"type": "adaptive"},
+                       "messages": msgs, "tools": tools}, hdr)
+    assert st == 200
+    evs = [json.loads(ln[6:]) for ln in raw.decode().splitlines() if ln.startswith("data: ")]
+    starts = [e for e in evs if e["type"] == "content_block_start"]
+    assert [s["content_block"]["type"] for s in starts] == ["thinking", "tool_use"]
+    deltas = [e["delta"] for e in evs if e["type"] == "content_block_delta"]
+    assert deltas[0] == {"type": "thinking_delta", "thinking": "Inspecting target file first."}
+    tc_id = starts[1]["content_block"]["id"]
+
+    # Step 2 (JSON): client echoes [thinking, tool_use] back; to_openai drops thinking so resume_held still hits.
+    msgs += [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "Inspecting target file first.", "signature": ""},
+            {"type": "tool_use", "id": tc_id, "name": "Read", "input": {"path": "a.py"}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tc_id, "content": "print(1)"}]},
+    ]
+    st, _, raw = post(port, "/v1/messages",
+                      {"model": "gemini-4-neon", "thinking": {"type": "adaptive"},
+                       "messages": msgs, "tools": tools}, hdr)
+    assert st == 200
+    r2 = json.loads(raw)
+    assert r2["stop_reason"] == "end_turn"
+    assert r2["content"] == [
+        {"type": "thinking", "thinking": "File contents look clean.", "signature": ""},
+        {"type": "text", "text": "All good."},
+    ]
+    # Single ACP session opened across step 1 -> step 2 (resume_held, not replay).
+    assert sum(1 for e in events(log) if e.get("ev") == "prompt") == 1
+
+    # Step 3: explicit thinking.type == "disabled" omits thinking block from response.
+    msgs += [{"role": "assistant", "content": r2["content"]}, {"role": "user", "content": "briefly"}]
+    st, _, raw = post(port, "/v1/messages",
+                      {"model": "gemini-4-neon", "thinking": {"type": "disabled"},
+                       "messages": msgs, "tools": tools}, hdr)
+    assert st == 200
+    r3 = json.loads(raw)
+    assert r3["content"] == [{"type": "text", "text": "Plain answer."}]
+
+
 def test_continue_and_nudge_without_usage_update_preserve_and_increment_sent_estimate(gateway):
     # A degenerate-reply nudge or continue delta when the session still has no usage_update must
     # increment _sent_input_estimate rather than overwriting it with the tiny nudge/delta prompt.

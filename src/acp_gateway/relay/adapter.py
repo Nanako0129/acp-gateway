@@ -118,9 +118,13 @@ def _nonneg_int(val: Any) -> int | None:
     return val if isinstance(val, int) and not isinstance(val, bool) and val >= 0 else None
 
 
-def to_message(result: dict[str, Any], model: str, input_tokens: int) -> dict[str, Any]:
+def to_message(result: dict[str, Any], model: str, input_tokens: int, *, include_thinking: bool = True) -> dict[str, Any]:
     """Conversation result -> Anthropic message object."""
     content: list[dict[str, Any]] = []
+    reasoning = result.get("reasoning")
+    has_thinking = include_thinking and isinstance(reasoning, str) and bool(reasoning.strip())
+    if has_thinking:
+        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
     if result.get("text"):
         content.append({"type": "text", "text": result["text"]})
     for call in result.get("tool_calls") or []:
@@ -137,8 +141,8 @@ def to_message(result: dict[str, Any], model: str, input_tokens: int) -> dict[st
     out_tok = _pos_int(reported.get("output_tokens"))
     if out_tok is None:
         out_tok = estimate_tokens(content)
-        if result.get("reasoning"):
-            out_tok += estimate_tokens(result["reasoning"])
+        if not has_thinking and isinstance(reasoning, str) and reasoning:
+            out_tok += estimate_tokens(reasoning)
     usage: dict[str, int] = {
         "input_tokens": in_tok if in_tok is not None else input_tokens,
         "output_tokens": out_tok,
@@ -162,7 +166,15 @@ def sse(message: dict[str, Any]) -> bytes:
     start = dict(message, content=[], stop_reason=None, usage=start_usage)
     out = [ev({"type": "message_start", "message": start})]
     for i, block in enumerate(message["content"]):
-        if block["type"] == "text":
+        if block["type"] == "thinking":
+            out += [ev({"type": "content_block_start", "index": i,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+                    ev({"type": "content_block_delta", "index": i,
+                        "delta": {"type": "thinking_delta", "thinking": block["thinking"]}})]
+            if block.get("signature"):
+                out.append(ev({"type": "content_block_delta", "index": i,
+                               "delta": {"type": "signature_delta", "signature": block["signature"]}}))
+        elif block["type"] == "text":
             out += [ev({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}),
                     ev({"type": "content_block_delta", "index": i,
                         "delta": {"type": "text_delta", "text": block["text"]}})]

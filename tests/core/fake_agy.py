@@ -99,6 +99,8 @@ def run_prompt(rid, sid, text, steps, token):
                          "status": "failed" if ans.get("isError") or ans.get("error") else "completed"})
         elif "text" in step:
             update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": step["text"]}})
+        elif "thought" in step:
+            update(sid, {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": step["thought"]}})
         elif step.get("echo_last"):
             update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": last}})
         elif "silent" in step:
