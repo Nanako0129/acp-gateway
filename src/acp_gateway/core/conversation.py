@@ -63,6 +63,178 @@ _SYS_MSG_RE = re.compile(r"<system-message>\n(.*?)\n</system-message>", re.DOTAL
 _SYS_MSG_DEDUPE_MIN_CHARS = 200
 _SYS_MSG_OMITTED = "<system-message>(unchanged from earlier in this session)</system-message>"
 _SYS_MSG_LATER = "<system-message>(same text is repeated in full later in this prompt)</system-message>"
+_PINNED_BLOCK_RE = re.compile(r"<(system-reminder|system-message)>\s*(.*?)\s*</\1>", re.DOTALL)
+_PINNED_REMINDER_PREFIXES = (
+    "Codebase and user instructions are shown below",
+    "Contents of ",
+    "Attribution for git commits and pull requests",
+    "SessionStart:",
+)
+_PINNED_MESSAGE_PREFIXES = (
+    "SessionStart:",
+    "# Environment\n",
+    "Available agent types for the Agent tool:",
+)
+
+
+def _is_pinned_instruction(tag: str, body: str) -> bool:
+    """True for persistent session-level instruction blocks injected by harnesses (e.g. Claude Code CLAUDE.md,
+    MEMORY.md, nested CLAUDE.md, git attribution, SessionStart plugin hooks) that must survive history trimming."""
+    head = body.lstrip()
+    if tag == "system-reminder":
+        return head.startswith(_PINNED_REMINDER_PREFIXES)
+    if tag == "system-message":
+        return head.startswith(_PINNED_MESSAGE_PREFIXES)
+    return False
+
+
+def _has_split_blocks(s: str, open_t: str, close_t: str) -> bool:
+    """True when ``s`` closes back to depth 0 and later opens another ``open_t`` (two blocks with optional text between)."""
+    depth = 0
+    pos = 0
+    end = len(s)
+    olen, clen = len(open_t), len(close_t)
+    closed_once = False
+    while pos < end:
+        nxt_open = s.find(open_t, pos)
+        nxt_close = s.find(close_t, pos)
+        if nxt_open == -1 and nxt_close == -1:
+            break
+        if nxt_open != -1 and (nxt_close == -1 or nxt_open < nxt_close):
+            if closed_once and depth == 0:
+                return True
+            depth += 1
+            pos = nxt_open + olen
+        else:
+            depth = max(0, depth - 1)
+            if depth == 0:
+                closed_once = True
+            pos = nxt_close + clen
+    return False
+
+
+def _match_standalone_pinned(text: str) -> str | None:
+    """Return stripped text if ``text`` is a single standalone pinned instruction block.
+
+    Uses outer tag boundaries rather than a lazy regex so literal closing tags quoted inside CLAUDE.md or
+    plugin instructions never truncate the extracted block early.
+    """
+    s = text.strip()
+    for tag in ("system-reminder", "system-message"):
+        open_t, close_t = f"<{tag}>", f"</{tag}>"
+        if s.startswith(open_t) and s.endswith(close_t) and not _has_split_blocks(s, open_t, close_t):
+            body = s[len(open_t):-len(close_t)]
+            if _is_pinned_instruction(tag, body):
+                return s
+    return None
+
+
+def _extract_pinned_instructions(
+    raw_history: list[dict[str, Any]],
+    active_content: Any = None,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Hoist persistent session instruction blocks out of historical user/tool rows so replay budget trimming
+    cannot drop CLAUDE.md, MEMORY.md, or SessionStart plugin rules, and so they sit in ``<SYSTEM_INSTRUCTIONS>``
+    rather than under the reference-only ``<HISTORICAL_CONTEXT>`` banner.
+
+    Tool rows only inspect content parts explicitly marked with ``_acp_harness: True`` (matching ``adapter.to_openai``'s
+    attachment of sibling harness reminders and folded system messages), never ``tool_result`` payload parts or raw tool
+    output strings, so data returned by tools cannot inject system instructions.
+    Caller message dicts and lists are never mutated.
+    """
+    seen_digests: set[str] = set()
+    if active_content is not None:
+        if isinstance(active_content, list):
+            for p in active_content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    t = str(p.get("text") or "")
+                    st = _match_standalone_pinned(t)
+                    if st is not None:
+                        seen_digests.add(hashlib.sha256(st.encode("utf-8")).hexdigest())
+                    else:
+                        for m in _PINNED_BLOCK_RE.finditer(t):
+                            if _is_pinned_instruction(m.group(1), m.group(2)):
+                                seen_digests.add(hashlib.sha256(m.group(0).strip().encode("utf-8")).hexdigest())
+        elif isinstance(active_content, str):
+            st = _match_standalone_pinned(active_content)
+            if st is not None:
+                seen_digests.add(hashlib.sha256(st.encode("utf-8")).hexdigest())
+            else:
+                for m in _PINNED_BLOCK_RE.finditer(active_content):
+                    if _is_pinned_instruction(m.group(1), m.group(2)):
+                        seen_digests.add(hashlib.sha256(m.group(0).strip().encode("utf-8")).hexdigest())
+
+    pinned: list[str] = []
+    clean_history: list[dict[str, Any]] = []
+
+    def _record(block: str) -> None:
+        d = hashlib.sha256(block.encode("utf-8")).hexdigest()
+        if d not in seen_digests:
+            seen_digests.add(d)
+            pinned.append(block)
+
+    def _strip_inline_user(text: str) -> tuple[str, bool]:
+        changed = False
+
+        def repl(m: re.Match[str]) -> str:
+            nonlocal changed
+            if not _is_pinned_instruction(m.group(1), m.group(2)):
+                return m.group(0)
+            changed = True
+            _record(m.group(0).strip())
+            return ""
+
+        out = _PINNED_BLOCK_RE.sub(repl, text)
+        return (out.strip(), True) if changed else (text, False)
+
+    for msg in raw_history:
+        role = msg.get("role")
+        if role not in ("user", "tool"):
+            clean_history.append(msg)
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            kept_parts: list[Any] = []
+            changed = False
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    if role == "tool" and not part.get("_acp_harness"):
+                        kept_parts.append(part)
+                        continue
+                    raw_t = str(part.get("text") or "")
+                    st = _match_standalone_pinned(raw_t)
+                    if st is not None:
+                        _record(st)
+                        changed = True
+                        continue
+                    if role == "user":
+                        stripped, part_changed = _strip_inline_user(raw_t)
+                        if part_changed:
+                            changed = True
+                            if stripped:
+                                kept_parts.append({**part, "text": stripped})
+                            continue
+                kept_parts.append(part)
+            if not changed:
+                clean_history.append(msg)
+            elif role == "user" and not kept_parts:
+                continue
+            else:
+                clean_history.append({**msg, "content": kept_parts})
+        elif role == "user" and isinstance(content, str):
+            st = _match_standalone_pinned(content)
+            if st is not None:
+                _record(st)
+                continue
+            stripped, changed = _strip_inline_user(content)
+            if not changed:
+                clean_history.append(msg)
+            elif stripped:
+                clean_history.append({**msg, "content": stripped})
+        else:
+            clean_history.append(msg)
+
+    return pinned, clean_history
 
 
 def _sys_digests(text: str) -> set[str]:
@@ -93,6 +265,38 @@ def dedupe_system_messages(text: str, seen: set[str] | None, later: set[str] | f
         return m.group(0)
 
     return _SYS_MSG_RE.sub(repl, text)
+
+
+_USAGE_KEYS = (
+    ("used", "used"),
+    ("size", "size"),
+    ("totalTokens", "total_tokens"),
+    ("total_tokens", "total_tokens"),
+    ("inputTokens", "input_tokens"),
+    ("input_tokens", "input_tokens"),
+    ("outputTokens", "output_tokens"),
+    ("output_tokens", "output_tokens"),
+    ("thoughtTokens", "thought_tokens"),
+    ("thought_tokens", "thought_tokens"),
+    ("cachedReadTokens", "cache_read_input_tokens"),
+    ("cached_read_tokens", "cache_read_input_tokens"),
+    ("cache_read_input_tokens", "cache_read_input_tokens"),
+    ("cachedWriteTokens", "cache_creation_input_tokens"),
+    ("cached_write_tokens", "cache_creation_input_tokens"),
+    ("cache_creation_input_tokens", "cache_creation_input_tokens"),
+)
+
+
+def _parse_usage(raw: Any) -> dict[str, int]:
+    """Extract non-negative integer usage counters from an ACP update or prompt result."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for src_k, dst_k in _USAGE_KEYS:
+        val = raw.get(src_k)
+        if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+            out[dst_k] = val
+    return out
 
 
 def degenerate(text: str) -> bool:
@@ -138,6 +342,27 @@ _HISTORY_TOOL_TRIM_BYTES = 4_000
 
 def _utf8_bytes(text: str) -> int:
     return len(text.encode("utf-8"))
+
+
+_IMAGE_TOKEN_ESTIMATE = 258  # flat fallback per attached image; avoids counting base64 bytes as text tokens
+
+
+def _estimate_prompt_tokens(blocks: list[dict[str, Any]], tools_fp: str = "") -> int:
+    """Rough token count of an ACP prompt payload actually sent to agy (UTF-8 bytes / 3 + flat image budget).
+
+    Used only when a fresh session returns before agy emits any usage_update, so large untrimmed histories
+    in the client's HTTP request body do not inflate reported input_tokens past the trimmed replay size.
+    """
+    text_bytes = _utf8_bytes(tools_fp) if tools_fp and tools_fp != "[]" else 0
+    img_count = 0
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "image":
+            img_count += 1
+        elif b.get("type") == "text":
+            text_bytes += _utf8_bytes(str(b.get("text") or ""))
+    return ((text_bytes + 2) // 3 if text_bytes > 0 else 0) + img_count * _IMAGE_TOKEN_ESTIMATE
 
 
 def _utf8_head(text: str, max_bytes: int) -> str:
@@ -390,9 +615,14 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
     if last_user >= 0:
         raw_history = [m for m in msgs[:last_user] if m.get("role") != "system"]
         raw_progress = [m for m in msgs[last_user + 1:] if m.get("role") != "system"]
+        pinned_sys, raw_history = _extract_pinned_instructions(raw_history, msgs[last_user].get("content"))
     else:
         raw_history = []
         raw_progress = [m for m in msgs if m.get("role") != "system"]
+        pinned_sys = []
+    if pinned_sys:
+        system = [*system, *pinned_sys]
+    pinned_digests = _sys_digests("\n\n".join(pinned_sys)) if pinned_sys else set()
 
     # Reserve a small margin for any skipped-image header note added by _Images.blocks().
     target_max = max(0, int(max_bytes))
@@ -403,7 +633,7 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
     if orig_bytes <= budget:
         final_text, sent = _render_pass(raw_history, raw_progress, imgs, sys_texts=system)
         if seen_sys is not None:
-            seen_sys.update(sent)
+            seen_sys.update(sent | pinned_digests)
         return imgs.blocks(final_text)
 
     # Over budget: (1) shrink oversized historical tool/assistant messages first, (2) drop oldest historical turns,
@@ -568,7 +798,12 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
         active_cap=active_cap, omit_note=omit_note,
     )
     if seen_sys is not None:
-        seen_sys.update(sent)
+        surviving_pinned = (
+            pinned_digests & _sys_digests("\n\n".join(sys_texts))
+            if pinned_digests and sys_texts
+            else set()
+        )
+        seen_sys.update(sent | surviving_pinned)
     logger.warning(
         "acp-gateway replay trimmed: %d -> %d UTF-8 bytes (kept %d/%d history msgs)",
         orig_bytes, _utf8_bytes(final_text), len(kept_history), len(raw_history),
@@ -632,6 +867,13 @@ class Conversation:
         self.text: list[str] = []
         self.reasoning: list[str] = []
         self.usage: dict[str, int] | None = None
+        self._last_used_tokens: int | None = None
+        self._prev_step_used: int | None = None
+        self._cache_read_ratio: float | None = None
+        self._sent_input_estimate: int | None = None
+        self._prompt_steps = 0
+        self._prompt_step_durations: list[float] = []
+        self._step_started = time.monotonic()
         self.images = _Images()  # image numbering of the current ACP session
         self._seen_sys_msgs: set[str] = set()  # sha256 of large <system-message> blocks already sent in this session
         self.fence = "TOOL-OUTPUT-" + secrets.token_hex(4)  # unguessable to tool output, stable across replays
@@ -696,6 +938,8 @@ class Conversation:
                     call.answer(*tool_answer(decision.tool_results.get(call.id, ""), self._seen_sys_msgs))
                 self.handed = []
                 self.last_activity = time.monotonic()
+                self._step_started = self.last_activity
+                self._prev_step_used = self._last_used_tokens
                 self.text, self.reasoning, self.usage = [], [], None
             elif decision.kind == "continue":
                 gen = self.gen
@@ -841,7 +1085,16 @@ class Conversation:
         if self.server is not None:
             self.server.clear_completed()
         self.text, self.reasoning, self.usage = [], [], None
+        if self._last_used_tokens is None:
+            if self._sent_input_estimate is None:
+                self._sent_input_estimate = max(1, _estimate_prompt_tokens(blocks, self.tools_fp))
+            else:
+                self._sent_input_estimate += _estimate_prompt_tokens(blocks)
+        self._prev_step_used = self._last_used_tokens
+        self._prompt_steps = 0
+        self._prompt_step_durations = []
         self.last_activity = time.monotonic()
+        self._step_started = self.last_activity
 
         def worker() -> None:
             try:
@@ -860,6 +1113,12 @@ class Conversation:
         self.retire_reason = reason
         self.handed = []
         self.guard, self.guard_refusals = set(), 0
+        self._last_used_tokens = None
+        self._prev_step_used = None
+        self._cache_read_ratio = None
+        self._sent_input_estimate = None
+        self._prompt_steps = 0
+        self._prompt_step_durations = []
         self.view = replace(self.view, live=False, handed_out=(), retired=True)
         if session is None:
             return
@@ -884,16 +1143,23 @@ class Conversation:
     # ---- callbacks (connection reader / MCP HTTP threads) -----------------------------------------------------
 
     def _on_call(self, gen: int, call: ParkedCall) -> None:
-        if gen != self.gen:
+        with self.lock:
+            if gen != self.gen:
+                retired, guarded, loop = True, False, False
+            elif (call.name, canonical_args(call.arguments)) in self.guard:
+                self.guard_refusals += 1
+                retired, guarded, loop = False, True, self.guard_refusals >= 2
+            else:
+                self.last_activity = time.monotonic()
+                retired, guarded, loop = False, False, False
+        if retired:
             call.answer("session retired", is_error=True)  # straggler from a retired session
             return
-        if (call.name, canonical_args(call.arguments)) in self.guard:
-            self.guard_refusals += 1
+        if guarded:
             call.answer(GUARD_TEXT, is_error=True)  # replay guard: never handed out twice
-            if self.guard_refusals >= 2:
+            if loop:
                 self.events.put((gen, "guard-loop", None))
             return
-        self.last_activity = time.monotonic()
         self.events.put((gen, "call", call))
 
     def _on_deadline(self, gen: int, call: ParkedCall) -> None:  # before child sees the isError
@@ -908,28 +1174,156 @@ class Conversation:
             session = self.session if self.gen == gen else None
         if session is None:
             return
+        drained: list[dict[str, Any]] = []
         while True:
             try:
-                u = session.updates.get_nowait()
+                drained.append(session.updates.get_nowait())
             except queue.Empty:
+                break
+        if not drained:
+            return
+        now = time.monotonic()
+        with self.lock:
+            if self.gen != gen:
                 return
-            self.last_activity = time.monotonic()
-            kind = u.get("sessionUpdate")
-            content = u.get("content") or {}
-            if kind == "agent_message_chunk" and content.get("type", "text") == "text":
-                self.text.append(str(content.get("text") or ""))
-            elif kind == "agent_thought_chunk" and content.get("type", "text") == "text":
-                self.reasoning.append(str(content.get("text") or ""))
-            elif kind == "usage_update":
-                usage: dict[str, int] = dict(self.usage or {})
-                for src_k, dst_k in (("used", "used"), ("size", "size"), ("inputTokens", "input_tokens"),
-                                     ("outputTokens", "output_tokens"), ("input_tokens", "input_tokens"),
-                                     ("output_tokens", "output_tokens")):
-                    val = u.get(src_k)
-                    if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
-                        usage[dst_k] = val
-                if usage:
-                    self.usage = usage
+            self.last_activity = now
+            for u in drained:
+                kind = u.get("sessionUpdate")
+                content = u.get("content") or {}
+                if kind == "agent_message_chunk" and content.get("type", "text") == "text":
+                    self.text.append(str(content.get("text") or ""))
+                elif kind == "agent_thought_chunk" and content.get("type", "text") == "text":
+                    self.reasoning.append(str(content.get("text") or ""))
+                elif kind == "usage_update":
+                    parsed = _parse_usage(u)
+                    if parsed:
+                        usage: dict[str, int] = dict(self.usage or {})
+                        usage.update(parsed)
+                        self.usage = usage
+                        if usage.get("used", 0) > 0:
+                            self._last_used_tokens = usage["used"]
+
+    def _record_step_duration(self) -> None:
+        self._prompt_steps += 1
+        self._prompt_step_durations.append(max(0.05, time.monotonic() - self._step_started))
+
+    def _build_call_usage(self) -> dict[str, int] | None:
+        """Per-step usage for a parked tool-call handout.
+
+        Preserves the session's last observed ``used`` count when ``MCP_CALL`` races ahead of ``usage_update``
+        (preventing a 2x fallback jump to ``estimate_tokens``), and on warm sessions carries forward the last
+        agy-reported cache-read ratio until ``session/prompt`` completes with exact totals.
+        """
+        self._record_step_duration()
+        u: dict[str, int] = dict(self.usage or {})
+        if u.get("used", 0) > 0:
+            self._last_used_tokens = u["used"]
+        elif "input_tokens" not in u:
+            fallback = self._last_used_tokens if self._last_used_tokens is not None else self._sent_input_estimate
+            if fallback is not None:
+                u["used"] = fallback
+        ratio = self._cache_read_ratio
+        if (
+            ratio is not None
+            and ratio > 0.0
+            and "input_tokens" not in u
+            and "cache_read_input_tokens" not in u
+            and "cache_creation_input_tokens" not in u
+            and u.get("used", 0) > 0
+        ):
+            used = u["used"]
+            cr = max(0, min(used, int(round(used * ratio))))
+            if self._prev_step_used is not None:
+                cr = min(cr, self._prev_step_used)
+            u["input_tokens"] = used - cr
+            u["cache_read_input_tokens"] = cr
+            u["cache_creation_input_tokens"] = 0
+        return u or None
+
+    def _build_end_usage(self, prompt_result: dict[str, Any] | None, *, extra_steps: int = 0) -> dict[str, int] | None:
+        """Final-step usage from ``session/prompt`` result combined with the step's ``usage_update``.
+
+        For single-step prompts, ``result["usage"]`` is exact and returned verbatim. For multi-step prompts
+        (parked MCP tool calls or guard-refused duplicate calls followed by ``end_turn``), ACP reports cumulative
+        totals across all internal LLM calls while ``usage_update.used`` reports the final step's single-call
+        context footprint: scaling the cumulative input/cache split into ``usage_update.used`` (or the session's
+        prior ``_last_used_tokens`` if the final step emitted no ``usage_update``) preserves exact context-% and
+        cache hit ratio without N-fold inflation, and scaling ``outputTokens``/``thoughtTokens`` by step-duration
+        share keeps ``tok/s`` aligned with the prompt's true output rate.
+        """
+        self._record_step_duration()
+        effective_steps = self._prompt_steps + max(0, extra_steps)
+        u: dict[str, int] = dict(self.usage or {})
+        step_used = u.get("used") if (u.get("used") or 0) > 0 else None
+        p = _parse_usage(prompt_result.get("usage") if isinstance(prompt_result, dict) else None)
+        if not p:
+            if "input_tokens" not in u and step_used is None:
+                fallback = self._last_used_tokens if self._last_used_tokens is not None else self._sent_input_estimate
+                if fallback is not None:
+                    u["used"] = fallback
+            return u or None
+
+        p_in = p.get("input_tokens")
+        p_cr = p.get("cache_read_input_tokens")
+        p_cw = p.get("cache_creation_input_tokens")
+        p_out = p.get("output_tokens")
+        p_th = p.get("thought_tokens")
+        p_tot = p.get("total_tokens")
+
+        if step_used is not None:
+            self._last_used_tokens = step_used
+        elif effective_steps <= 1 and p_tot is not None and p_tot > 0:
+            self._last_used_tokens = p_tot
+
+        sum_in = (p_in + (p_cr or 0) + (p_cw or 0)) if p_in is not None else None
+        if sum_in is not None and sum_in > 0:
+            self._cache_read_ratio = min(1.0, max(0.0, (p_cr or 0) / sum_in))
+
+        scale_target = step_used if step_used is not None else (
+            self._last_used_tokens if effective_steps >= 2 else None
+        )
+        is_multi_inflated = (
+            effective_steps >= 2
+            and scale_target is not None
+            and sum_in is not None
+            and sum_in > 0
+            and (sum_in + (p_out or 0)) > scale_target
+        )
+        if not is_multi_inflated:
+            u.update(p)
+            return u or None
+
+        assert scale_target is not None and sum_in is not None
+        if effective_steps > len(self._prompt_step_durations):
+            share = 1.0 / effective_steps
+        else:
+            total_dur = sum(self._prompt_step_durations)
+            share = (self._prompt_step_durations[-1] / total_dur) if total_dur > 0 else (1.0 / effective_steps)
+
+        step_out = 0
+        out_ratio = share
+        if p_out is not None:
+            if p_out > 0:
+                step_out = max(1, min(p_out, int(round(p_out * share))))
+                if scale_target > 1:
+                    step_out = min(step_out, scale_target - 1)
+                out_ratio = step_out / p_out
+            else:
+                out_ratio = 0.0
+            u["output_tokens"] = step_out
+
+        step_in_budget = max(0, scale_target - step_out)
+        step_cr = max(0, min(step_in_budget, int(round(step_in_budget * ((p_cr or 0) / sum_in)))))
+        step_cw = max(0, min(step_in_budget - step_cr, int(round(step_in_budget * ((p_cw or 0) / sum_in)))))
+        u["input_tokens"] = step_in_budget - step_cr - step_cw
+        u["cache_read_input_tokens"] = step_cr
+        u["cache_creation_input_tokens"] = step_cw
+        if p_th is not None:
+            if p_out is not None:
+                u["thought_tokens"] = max(0, min(step_out, int(round(p_th * out_ratio))))
+            else:
+                u["thought_tokens"] = max(0, min(p_th, int(round(p_th * share))))
+        return u or None
 
     def _fail(self, gen: int, reason: str, exc: ProviderError, *, drop_conn: bool = False) -> ProviderError:
         with self.lock:
@@ -986,12 +1380,14 @@ class Conversation:
                         continue  # retired/cancelled meanwhile: the loop top raises
                     self.handed = calls
                     self.view = view_after(messages, handed_out=tuple(c.id for c in calls), live=True)
+                    call_usage = self._build_call_usage()
+                    text, reasoning = "".join(self.text), "".join(self.reasoning)
                     if self.stateless:
                         self._retire("stateless-handout")
                     elif self.terminal_tools and all(c.name in self.terminal_tools for c in calls):
                         self._retire("terminal-handout")  # caller ends on this tool (e.g. SubagentHandback)
-                return {"text": "".join(self.text), "reasoning": "".join(self.reasoning), "tool_calls": calls,
-                        "finish_reason": "tool_calls", "usage": dict(self.usage) if self.usage else None}
+                return {"text": text, "reasoning": reasoning, "tool_calls": calls,
+                        "finish_reason": "tool_calls", "usage": call_usage}
             if kind == "end":
                 self._drain_updates(gen)
                 if payload.stop_reason == "cancelled":
@@ -1005,12 +1401,15 @@ class Conversation:
                         logger.info("acp-gateway: degenerate final reply (%d chars); asking once more", len(reply))
                         self._start_prompt(gen, [{"type": "text", "text": NUDGE_TEXT.format(reply=reply.strip())}])
                         continue
+                    guard_refusals = self.guard_refusals
                     self.guard, self.guard_refusals = set(), 0
                     self.view = view_after(messages)
                     if self.server is not None:
                         self.server.clear_completed()
-                return {"text": "".join(self.text), "reasoning": "".join(self.reasoning), "tool_calls": [],
-                        "finish_reason": payload.finish_reason, "usage": dict(self.usage) if self.usage else None}
+                    end_usage = self._build_end_usage(payload.result, extra_steps=guard_refusals)
+                    text, reasoning = "".join(self.text), "".join(self.reasoning)
+                return {"text": text, "reasoning": reasoning, "tool_calls": [],
+                        "finish_reason": payload.finish_reason, "usage": end_usage}
             if kind == "guard-loop":
                 self._drain_updates(gen)
                 with self.lock:

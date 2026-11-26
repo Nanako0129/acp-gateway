@@ -54,7 +54,7 @@ PYTHONPATH=src python3.11 -m acp_gateway.client --command <agent-bin> --workspac
 | `ACP_GATEWAY_PIN_VERSION` | `1.5.2` | Pinned `agentInfo.version` required from `initialize` |
 | `ACP_GATEWAY_MODEL` | `gemini-4-hydrogen-medium` | Default Gemini model ID |
 | `ACP_GATEWAY_MAX_CHILDREN` | `6` | Maximum concurrent ACP child processes |
-| `ACP_GATEWAY_STEP_DEADLINE` | `240` | Seconds without ACP activity before a step times out |
+| `ACP_GATEWAY_STEP_DEADLINE` | `480` | Seconds without ACP activity before a step times out |
 | `ACP_GATEWAY_TERMINAL_TOOLS` | `SubagentHandback` | Comma-separated tools that retire a branch immediately |
 | `ACP_GATEWAY_COLLECT_WINDOW` | `0.05` | Seconds to batch parallel MCP tool calls per step |
 | `ACP_GATEWAY_WARM_STANDBY` | `1` | Pre-warmed initialized ACP children kept ready |

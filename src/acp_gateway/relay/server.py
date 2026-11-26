@@ -233,7 +233,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             logger.info("acp-gateway: request failed (%s)", type(exc).__name__)
             self._send(529, _error("overloaded_error", "Antigravity request failed"), no_retry=True)
             return
-        msg = to_message(result, model, estimate_tokens(body))
+        thinking_cfg = body.get("thinking")
+        include_thinking = not (isinstance(thinking_cfg, dict) and thinking_cfg.get("type") == "disabled")
+        msg = to_message(result, model, estimate_tokens(body), include_thinking=include_thinking)
         logger.info("acp-gateway: served %s in %.1fs (%d messages in, %s)", msg["stop_reason"],
                     time.monotonic() - started, len(body.get("messages") or []),
                     ",".join(b["type"] for b in msg["content"]) or "empty")

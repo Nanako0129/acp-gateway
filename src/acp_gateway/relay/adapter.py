@@ -81,7 +81,8 @@ def to_openai(body: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str
             rows.append({"role": "assistant", "content": text, **({"tool_calls": calls} if calls else {})})
             continue
         if role == "system":
-            wrapped = [{"type": "text", "text": "<system-message>\n" + _system_text(content) + "\n</system-message>"}]
+            wrapped = [{"type": "text", "text": "<system-message>\n" + _system_text(content) + "\n</system-message>",
+                        "_acp_harness": True}]
             if rows and rows[-1]["role"] in ("user", "tool"):
                 rows[-1]["content"] = rows[-1]["content"] + wrapped
             else:
@@ -95,7 +96,7 @@ def to_openai(body: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str
                 if b.get("is_error"):
                     parts = [{"type": "text", "text": "[tool error]"}] + parts
                 rows.append({"role": "tool", "tool_call_id": str(b.get("tool_use_id")), "content": parts})
-            rows[-1]["content"] = rows[-1]["content"] + others
+            rows[-1]["content"] = rows[-1]["content"] + [{**p, "_acp_harness": True} for p in others]
         else:
             rows.append({"role": "user", "content": others})
     tools = [{"type": "function", "function": {"name": str(t.get("name")), "description": str(t.get("description") or ""),
@@ -114,21 +115,43 @@ def _pos_int(val: Any) -> int | None:
     return val if isinstance(val, int) and not isinstance(val, bool) and val > 0 else None
 
 
-def to_message(result: dict[str, Any], model: str, input_tokens: int) -> dict[str, Any]:
+def _nonneg_int(val: Any) -> int | None:
+    return val if isinstance(val, int) and not isinstance(val, bool) and val >= 0 else None
+
+
+def to_message(result: dict[str, Any], model: str, input_tokens: int, *, include_thinking: bool = True) -> dict[str, Any]:
     """Conversation result -> Anthropic message object."""
     content: list[dict[str, Any]] = []
+    reasoning = result.get("reasoning")
+    has_thinking = include_thinking and isinstance(reasoning, str) and bool(reasoning.strip())
+    if has_thinking:
+        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
     if result.get("text"):
         content.append({"type": "text", "text": result["text"]})
     for call in result.get("tool_calls") or []:
         content.append({"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments or {}})
     stop = "tool_use" if result.get("tool_calls") else STOP_REASON.get(result.get("finish_reason") or "stop", "end_turn")
     reported = result.get("usage") if isinstance(result.get("usage"), dict) else {}
-    in_tok = _pos_int(reported.get("input_tokens")) or _pos_int(reported.get("used"))
+    cr_tok = _nonneg_int(reported.get("cache_read_input_tokens"))
+    cw_tok = _nonneg_int(reported.get("cache_creation_input_tokens"))
+    raw_in = _nonneg_int(reported.get("input_tokens"))
+    if raw_in is not None and (raw_in > 0 or (cr_tok or 0) > 0 or (cw_tok or 0) > 0):
+        in_tok: int | None = raw_in
+    else:
+        in_tok = _pos_int(reported.get("used"))
     out_tok = _pos_int(reported.get("output_tokens"))
-    usage = {
+    if out_tok is None:
+        out_tok = estimate_tokens(content)
+        if not has_thinking and isinstance(reasoning, str) and reasoning:
+            out_tok += estimate_tokens(reasoning)
+    usage: dict[str, int] = {
         "input_tokens": in_tok if in_tok is not None else input_tokens,
-        "output_tokens": out_tok if out_tok is not None else estimate_tokens(content),
+        "output_tokens": out_tok,
     }
+    if cr_tok is not None:
+        usage["cache_read_input_tokens"] = cr_tok
+    if cw_tok is not None:
+        usage["cache_creation_input_tokens"] = cw_tok
     # A fresh id per response: clients merge assistant messages that share an id.
     return {"id": "msg_" + uuid.uuid4().hex, "type": "message", "role": "assistant", "model": model,
             "content": content, "stop_reason": stop, "stop_sequence": None, "usage": usage}
@@ -139,11 +162,20 @@ def sse(message: dict[str, Any]) -> bytes:
     def ev(obj: dict[str, Any]) -> str:
         return f"event: {obj['type']}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-    start = dict(message, content=[], stop_reason=None,
-                 usage={"input_tokens": message["usage"]["input_tokens"], "output_tokens": 0})
+    start_usage = {k: v for k, v in message["usage"].items() if k != "output_tokens"}
+    start_usage["output_tokens"] = 0
+    start = dict(message, content=[], stop_reason=None, usage=start_usage)
     out = [ev({"type": "message_start", "message": start})]
     for i, block in enumerate(message["content"]):
-        if block["type"] == "text":
+        if block["type"] == "thinking":
+            out += [ev({"type": "content_block_start", "index": i,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+                    ev({"type": "content_block_delta", "index": i,
+                        "delta": {"type": "thinking_delta", "thinking": block["thinking"]}})]
+            if block.get("signature"):
+                out.append(ev({"type": "content_block_delta", "index": i,
+                               "delta": {"type": "signature_delta", "signature": block["signature"]}}))
+        elif block["type"] == "text":
             out += [ev({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}),
                     ev({"type": "content_block_delta", "index": i,
                         "delta": {"type": "text_delta", "text": block["text"]}})]

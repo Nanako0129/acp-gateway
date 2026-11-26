@@ -294,12 +294,14 @@ def test_rerun_preserves_user_model_models_efforts_and_reconciles_transport(tmp_
 
     custom_models = {"hydrogen": "acp-gemini-4-hydrogen[1m]", "neon": "acp-gemini-4-neon[1m]"}
     custom_efforts = {"hydrogen": ["low", "medium", "high", "xhigh"]}
+    custom_tier_models = {"haiku": "acp-gemini-4-hydrogen[1m]", "sonnet": "acp-gemini-4-hydrogen[1m]", "opus": "inherit"}
     cfg = json.loads(sb["relay"].read_text(encoding="utf-8"))
     cfg["providers"]["agy"].update(
         {
             "model": "acp-gemini-4-hydrogen[1m]",
             "models": custom_models,
             "efforts": custom_efforts,
+            "tierModels": custom_tier_models,
             "baseUrl": "http://127.0.0.1:9999",
             "token": "stale-token",
             "matchModels": ["^stale-"],
@@ -317,6 +319,7 @@ def test_rerun_preserves_user_model_models_efforts_and_reconciles_transport(tmp_
     assert reconciled["model"] == "acp-gemini-4-hydrogen[1m]"
     assert reconciled["models"] == custom_models
     assert reconciled["efforts"] == custom_efforts
+    assert reconciled["tierModels"] == custom_tier_models
     assert reconciled["baseUrl"] == f"http://127.0.0.1:{TEST_PORT}"
     assert reconciled["token"] == "acp-gateway-local"
     assert reconciled["matchModels"] == ["^acp-gemini-"]

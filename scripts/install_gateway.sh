@@ -87,7 +87,7 @@ with open(path, "r+", encoding="utf-8") as fh:
         merged = dict(desired)
         existing = providers.get("agy")
         if isinstance(existing, dict):
-            for key in ("model", "models", "efforts"):
+            for key in ("model", "models", "efforts", "tierModels"):
                 if key in existing:
                     merged[key] = existing[key]
         if existing == merged:
